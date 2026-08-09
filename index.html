@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Purrch</title>
+    <style>
+      /* Courier New is a print face — thin, small-x-height, badly hinted at the
+         sizes this UI uses. Prefer whatever screen monospace the OS actually
+         ships, and keep Courier only as the last resort. */
+      :root {
+        --mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas,
+          "Courier New", monospace;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        overflow: hidden;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

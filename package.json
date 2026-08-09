@@ -1,0 +1,25 @@
+{
+  "name": "purrch",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "art:preview": "node scripts/preview.ts",
+    "art:coats": "node scripts/coats.ts",
+    "icons": "node scripts/make-icons.ts"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5",
+    "@tauri-apps/cli": "^2",
+    "svelte": "^5",
+    "typescript": "^5",
+    "vite": "^6"
+  }
+}
