@@ -236,12 +236,17 @@ mod tests {
     fn the_auth_override_only_appears_for_a_key() {
         for auth in [Auth::Inherit, Auth::Subscription] {
             assert!(
-                !args_for(auth).iter().any(|a| a.contains("preferred_auth_method")),
+                !args_for(auth)
+                    .iter()
+                    .any(|a| a.contains("preferred_auth_method")),
                 "{auth:?} overrode the auth method"
             );
         }
         let args = args_for(Auth::Key);
-        let i = args.iter().position(|a| a == "--config").expect("no override");
+        let i = args
+            .iter()
+            .position(|a| a == "--config")
+            .expect("no override");
         assert_eq!(
             args.get(i + 1).map(String::as_str),
             Some("preferred_auth_method=\"apikey\"")

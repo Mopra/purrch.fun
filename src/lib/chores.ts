@@ -33,6 +33,21 @@ export interface Chore {
   session: string | null;
 }
 
+/**
+ * One tool the cat picked up while it was out. Mirrors `chores::Step`.
+ *
+ * The turn you ask for streams its tools into the panel where you watch them
+ * go by — that visible feed is the whole answer to "it follows whatever it
+ * reads". A chore firing at 09:00 has nobody watching, so its feed is kept
+ * instead, and this is it.
+ */
+export interface Step {
+  tool: string;
+  detail: string;
+  /** null if the hunt died while this one was still running. */
+  ok: boolean | null;
+}
+
 /** What the cat brought back. Mirrors `chores::Gift`. */
 export interface Gift {
   id: string;
@@ -42,7 +57,9 @@ export interface Gift {
   at: number;
   ok: boolean;
   text: string;
+  /** Can exceed `trail.length` — that's how you know it was cut off. */
   tools: number;
+  trail: Step[];
   read: boolean;
 }
 
@@ -158,7 +175,13 @@ export async function remove(id: string): Promise<void> {
   await api?.invoke("chores_remove", { id });
 }
 
-/** Go now. Still queues behind whatever the cat is already doing. */
+/**
+ * Go now. Still queues behind whatever the cat is already doing.
+ *
+ * Rejects when the cat has spent its day, or when the colony hasn't been let
+ * loose — somebody is watching this one, so a button that silently did nothing
+ * would be worse than an answer.
+ */
 export async function runNow(id: string): Promise<void> {
   const api = await tauri();
   await api?.invoke("chores_run_now", { id });

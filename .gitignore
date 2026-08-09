@@ -4,3 +4,15 @@ src-tauri/target/
 src-tauri/gen/schemas/
 preview.png
 preview-big.png
+
+# Local agent settings — machine-specific, not the project's business.
+.claude/settings.local.json
+
+# Half-written stores, if anything ever dies mid-rename.
+*.json.tmp
+
+# Updater signing key. The public half lives in tauri.conf.json; the private
+# half must never be in the repo. See RELEASING.md.
+*.key
+*.key.pub
+.tauri/

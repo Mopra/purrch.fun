@@ -7,20 +7,42 @@
 
   import * as chores from "./lib/chores.ts";
 
+  import * as colony from "./lib/colony.ts";
+
   let {
     board,
     live = null,
     cwd = null,
+    spend,
+    budget,
+    startsWithWindows = false,
+    note = "",
     onadd,
     onsave,
     onremove,
     ontoggle,
     onrun,
+    onbudget,
+    onautostart,
     onclose,
   }: {
     board: chores.Chore[];
     /** The chore this cat is out on right now, if any. */
     live?: chores.Live | null;
+    /** What this cat has spent of its day. */
+    spend: colony.Spend;
+    /** The colony-wide cap those hunts are counted against. */
+    budget: number;
+    /**
+     * Whether Purrch comes back at login.
+     *
+     * The board cares because it is the one screen whose promise depends on
+     * it: a chore that fires every hour does nothing at all on a machine where
+     * Purrch is only running when the user remembers to open it.
+     */
+    startsWithWindows?: boolean;
+    /** Why the last "go now" didn't, if it didn't. */
+    note?: string;
     /**
      * Where the cat is standing, which is where a new chore will stand too.
      * Drop a folder on the cat to change it — a chore that watches a repo has
@@ -32,8 +54,12 @@
     onremove: (id: string) => void;
     ontoggle: (id: string, enabled: boolean) => void;
     onrun: (id: string) => void;
+    onbudget: (hunts: number) => void;
+    onautostart: () => void;
     onclose: () => void;
   } = $props();
+
+  const spentOut = $derived(spend.today >= spend.cap);
 
   /** The chore being edited, or `""` for the blank one at the bottom. */
   let editing = $state<string | null>(null);
@@ -117,6 +143,9 @@
     const every = chores.everyLabel(chore.everyMs);
     if (!chore.enabled) return `${every} · paused`;
     if (live?.chore === chore.id) return `${every} · out now`;
+    // A slot that comes due while the cat is spent out is a miss, not a delay,
+    // so promising a time it won't keep would be the wrong thing to say.
+    if (spentOut) return `${every} · resting`;
     return `${every} · ${chores.when(chore.nextDue, now)}`;
   }
 </script>
@@ -129,6 +158,47 @@
   </header>
 
   <div class="body">
+    <!-- The day's spending, always in view. The burn is the thing that goes
+         wrong with a chore board, and it goes wrong quietly — you find out from
+         your own session hitting a wall, hours later, somewhere else. -->
+    <div class="budget" class:spent={spentOut}>
+      <span class="bar" aria-hidden="true">
+        <span
+          class="fill"
+          style="width: {Math.min(100, (spend.today / Math.max(spend.cap, 1)) * 100)}%"
+        ></span>
+      </span>
+      <span class="count">
+        {spend.today} / {spend.cap} errands today
+        {#if spentOut && spend.nextFree}
+          · back {chores.when(spend.nextFree, now)}
+        {/if}
+      </span>
+      <select
+        value={budget}
+        onchange={(e) => onbudget(Number(e.currentTarget.value))}
+        title="how much this cat may do on its own in a day"
+      >
+        {#each colony.BUDGETS as b (b.hunts)}
+          <option value={b.hunts}>{b.label}</option>
+        {/each}
+      </select>
+    </div>
+
+    {#if note}
+      <p class="note">{note}</p>
+    {/if}
+
+    <!-- The board's premise is a machine that's already on. It isn't, unless
+         this is. Only worth saying once there's something to miss. -->
+    {#if board.length > 0 && !startsWithWindows}
+      <p class="note nudge">
+        Purrch isn't set to start with Windows, so these only run while you've
+        got it open.
+        <button class="link" onclick={onautostart}>start it at login</button>
+      </p>
+    {/if}
+
     {#if board.length === 0 && editing === null}
       <p class="empty">
         Nothing on the board. Give this cat something to go and check on while
@@ -252,7 +322,8 @@
 
     <p class="hint">
       Every chore is a turn against your subscription, whether it finds anything
-      or not. Slower is cheaper, and most checks come back with nothing.
+      or not. Slower is cheaper, and most checks come back with nothing. What
+      each one did is kept with its gift.
     </p>
   </div>
 
@@ -318,6 +389,81 @@
     margin: 0;
     color: #8f6f86;
     line-height: 1.5;
+  }
+
+  /* The day's spending. Deliberately the first thing in the panel and not a
+     footnote — it's the number that decides whether the board is a good idea. */
+  .budget {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-areas: "bar bar" "count cap";
+    align-items: center;
+    gap: 4px 6px;
+    padding: 6px;
+    background: #2c1a28;
+    border-radius: 4px;
+  }
+
+  .budget .bar {
+    grid-area: bar;
+    height: 3px;
+    border-radius: 2px;
+    background: #4a2f44;
+    overflow: hidden;
+  }
+
+  .budget .fill {
+    display: block;
+    height: 100%;
+    background: var(--accent, #f5a05c);
+  }
+
+  .budget .count {
+    grid-area: count;
+    font-size: 10px;
+    color: #c99ab8;
+  }
+
+  .budget select {
+    grid-area: cap;
+    flex: 0 0 auto;
+    font-size: 10px;
+    padding: 2px 3px;
+  }
+
+  /* A cat that's done its day. The bar goes the colour of a thing that has
+     stopped rather than a thing that has gone wrong — it hasn't. */
+  .budget.spent .fill {
+    background: #e8616e;
+  }
+
+  .budget.spent .count {
+    color: #e8a0a8;
+  }
+
+  .note {
+    margin: 0;
+    padding: 5px 6px;
+    background: #33221f;
+    border-radius: 4px;
+    color: #e8c07d;
+    line-height: 1.45;
+  }
+
+  .note.nudge {
+    background: #23283a;
+    color: #b6cfe8;
+  }
+
+  .link {
+    all: unset;
+    color: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  .link:hover {
+    color: #fff6e8;
   }
 
   .hint {

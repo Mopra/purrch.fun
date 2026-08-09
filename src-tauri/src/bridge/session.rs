@@ -43,6 +43,13 @@ pub struct Outcome {
     /// The last thing the cat actually said.
     pub text: Option<String>,
     pub tools: u32,
+    /// Every tool it picked up, in order.
+    ///
+    /// The panel builds its own feed from the live events and ignores this; a
+    /// hunt has nobody watching, so this is the only record that it happened at
+    /// all. Kept whole here and trimmed when the gift is written, so the
+    /// trimming rule lives with the store rather than with the stream.
+    pub trail: Vec<crate::chores::Step>,
     /// Set when the turn ended in a `Failed` event rather than a `Finished`.
     pub error: Option<String>,
     /// The turn was cut short — the user started talking, or the cat went
@@ -129,7 +136,22 @@ fn observe(out: &mut Outcome, event: &BridgeEvent) {
         // Kept as a fallback: a CLI that dies after saying something useful
         // still has something to show for itself.
         BridgeEvent::Text { text } => out.text = Some(text.clone()),
-        BridgeEvent::ToolStart { .. } => out.tools += 1,
+        BridgeEvent::ToolStart { tool, detail } => {
+            out.tools += 1;
+            out.trail.push(crate::chores::Step {
+                tool: tool.clone(),
+                detail: detail.clone(),
+                ok: None,
+            });
+        }
+        // The id in the event doesn't map back to a name, so this closes out
+        // the most recent step still open — the same thing the panel's feed
+        // does, and right for a stream that starts one tool at a time.
+        BridgeEvent::ToolEnd { ok, .. } => {
+            if let Some(step) = out.trail.iter_mut().rev().find(|s| s.ok.is_none()) {
+                step.ok = Some(*ok);
+            }
+        }
         BridgeEvent::Finished { ok, text, .. } => {
             out.ok = *ok;
             if text.is_some() {
@@ -199,9 +221,9 @@ pub async fn run(
 
     detect::hide_console(cmd.as_std_mut());
 
-    let mut child = cmd.spawn().map_err(|e| {
-        format!("couldn't start {}: {e}", backend.label)
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("couldn't start {}: {e}", backend.label))?;
 
     let stdout = child.stdout.take().ok_or("no stdout from agent")?;
     let stderr = child.stderr.take().ok_or("no stderr from agent")?;

@@ -60,6 +60,17 @@ export interface CatPose {
   lean: number; // scene px the dangling half swings sideways (hang only)
   bob: number; // vertical offset of whole cat (sleep breathing / pet squash)
   lift: number; // scene px the cat is off the ground mid-jump
+  /**
+   * Radians the whole cat is turned by, about the middle of its body.
+   *
+   * The one thing in here that isn't a layer swap. Whirl the cat around on the
+   * end of the pointer and the dangle turns into a tumble, and a tumble is the
+   * one pose that can't be drawn: it isn't a shape a cat holds, it's every
+   * shape it already has, seen from a different angle. So the art is drawn
+   * flat and the finished cat is turned as one piece, which keeps the face on
+   * the head and the paws on the legs all the way round.
+   */
+  spin: number;
   groomPaw: "none" | "up" | "down";
   playPaw: "none" | "ready" | "swat"; // front-left leg while chasing the yarn
   bigBlush: boolean;
@@ -169,6 +180,33 @@ function bend(y: number, height: number, pivot: number, lean: number): number {
   return Math.round(lean * t * t);
 }
 
+/**
+ * Lays one colour onto one pixel at opacity `a`, source-over — so a half-faded
+ * heart passing the cat thins itself rather than punching a hole in the coat.
+ */
+function paint(
+  buf: Uint8ClampedArray,
+  idx: number,
+  r: number,
+  g: number,
+  b: number,
+  a: number,
+): void {
+  if (a >= 1) {
+    buf[idx] = r;
+    buf[idx + 1] = g;
+    buf[idx + 2] = b;
+    buf[idx + 3] = 255;
+    return;
+  }
+  const da = buf[idx + 3] / 255;
+  const oa = a + da * (1 - a);
+  buf[idx] = (r * a + buf[idx] * da * (1 - a)) / oa;
+  buf[idx + 1] = (g * a + buf[idx + 1] * da * (1 - a)) / oa;
+  buf[idx + 2] = (b * a + buf[idx + 2] * da * (1 - a)) / oa;
+  buf[idx + 3] = oa * 255;
+}
+
 function stamp(
   buf: Uint8ClampedArray,
   RGB: Rgb,
@@ -192,25 +230,86 @@ function stamp(
       if (!rgb) continue;
       const a = alpha * edgeAlpha(px, py);
       if (a <= 0) continue;
-      const idx = (py * SCENE_W + px) * 4;
-      if (a >= 1) {
-        buf[idx] = rgb[0];
-        buf[idx + 1] = rgb[1];
-        buf[idx + 2] = rgb[2];
-        buf[idx + 3] = 255;
-        continue;
-      }
-      // source-over onto whatever is already there, so a half-faded heart
-      // passing the cat thins itself rather than punching a hole in the coat
-      const da = buf[idx + 3] / 255;
-      const oa = a + da * (1 - a);
-      for (let c = 0; c < 3; c++) {
-        buf[idx + c] = (rgb[c] * a + buf[idx + c] * da * (1 - a)) / oa;
-      }
-      buf[idx + 3] = oa * 255;
+      paint(buf, (py * SCENE_W + px) * 4, rgb[0], rgb[1], rgb[2], a);
     }
   }
 }
+
+/**
+ * The point a turning cat turns about: the middle of the box its body fills.
+ *
+ * Measured off the body grid alone rather than off the finished frame, so the
+ * pivot belongs to the posture and to nothing else. Taking it from what's been
+ * drawn would let a tail swishing from `down` to `up` shift the centre a pixel
+ * and turn a steady spin into a wobble. Cached — there are four bodies and the
+ * tumble asks for one on every frame.
+ */
+const PIVOTS = new Map<Grid, [number, number]>();
+
+function pivotOf(grid: Grid): [number, number] {
+  const hit = PIVOTS.get(grid);
+  if (hit) return hit;
+  let x0 = Infinity;
+  let x1 = -Infinity;
+  let y0 = Infinity;
+  let y1 = -Infinity;
+  for (let y = 0; y < grid.length; y++) {
+    const row = grid[y];
+    for (let x = 0; x < row.length; x++) {
+      if (row[x] === ".") continue;
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+    }
+  }
+  const at: [number, number] = x1 < x0 ? [0, 0] : [(x0 + x1) / 2, (y0 + y1) / 2];
+  PIVOTS.set(grid, at);
+  return at;
+}
+
+/**
+ * Turns the flat cat in `src` onto `dst`, `angle` radians about (px, py).
+ *
+ * Walks the destination and reads back, which is the only way round that
+ * leaves no gaps: going forwards, a turned pixel lands wherever it lands and
+ * the ones it misses stay holes. Nearest neighbour, deliberately — the cat is a
+ * pixel drawing, and a cat whose outline blurs at 40° stops being drawn and
+ * starts being a photograph of itself.
+ */
+function turn(
+  dst: Uint8ClampedArray,
+  src: Uint8ClampedArray,
+  px: number,
+  py: number,
+  angle: number,
+): void {
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  for (let y = 0; y < SCENE_H; y++) {
+    for (let x = 0; x < SCENE_W; x++) {
+      const dx = x - px;
+      const dy = y - py;
+      const sx = Math.round(px + dx * cos + dy * sin);
+      const sy = Math.round(py - dx * sin + dy * cos);
+      if (sx < 0 || sx >= SCENE_W || sy < 0 || sy >= SCENE_H) continue;
+      const si = (sy * SCENE_W + sx) * 4;
+      // The fade is applied here rather than carried over from the flat cat:
+      // what matters is how close to the window edge a pixel ends up, not where
+      // it started, and a leg swinging out wide ends up somewhere else entirely.
+      const a = (src[si + 3] / 255) * edgeAlpha(x, y);
+      if (a <= 0) continue;
+      paint(dst, (y * SCENE_W + x) * 4, src[si], src[si + 1], src[si + 2], a);
+    }
+  }
+}
+
+/**
+ * Scratch the cat is drawn flat into before being turned. Reused between
+ * frames: a tumble asks for one on every animation frame, and a fresh 7KB of
+ * rubbish sixty times a second buys nothing.
+ */
+let flat: Uint8ClampedArray<ArrayBuffer> | null = null;
 
 /**
  * Renders the full scene into an RGBA buffer (SCENE_W x SCENE_H).
@@ -225,7 +324,10 @@ export function renderScene(
   particles: Particle[] = [],
   yarn: Particle | null = null,
   coat: Coat = coatById(null),
-): Uint8ClampedArray {
+  // `ArrayBuffer` rather than the default `ArrayBufferLike`: the callers hand
+  // this straight to `new ImageData(...)`, which will not take a buffer that
+  // might turn out to be shared.
+): Uint8ClampedArray<ArrayBuffer> {
   const buf = new Uint8ClampedArray(SCENE_W * SCENE_H * 4);
   const rgb = rgbFor(coat);
   const body = BODIES[pose.posture];
@@ -239,31 +341,52 @@ export function renderScene(
   // Only the body swings; the head is the bit being held.
   const lean = pose.posture === "hang" ? pose.lean : 0;
 
+  // A turning cat is drawn into a layer of its own and turned as one piece at
+  // the end, so the tail, face and paws all come round together. Everything
+  // that isn't the animal stays where it is: the yarn belongs to the floor, so
+  // it goes down first and the cat turns in front of it. Nothing is lost by
+  // dropping it behind the paws — a cat mid-whirl isn't swatting at anything.
+  const turning = pose.spin !== 0;
+  let cat = buf;
+  if (turning) {
+    if (!flat) flat = new Uint8ClampedArray(SCENE_W * SCENE_H * 4);
+    else flat.fill(0);
+    cat = flat;
+    if (yarn) stamp(buf, rgb, yarn.grid, Math.round(yarn.x), Math.round(yarn.y), yarn.alpha);
+  }
+
   // tail first so the body overlaps its root
-  if (WEARS_TAIL[pose.posture]) stamp(buf, rgb, TAILS[pose.tail], cx, cy);
-  stamp(buf, rgb, body, cx, cy, 1, lean, HANG_PIVOT);
+  if (WEARS_TAIL[pose.posture]) stamp(cat, rgb, TAILS[pose.tail], cx, cy);
+  stamp(cat, rgb, body, cx, cy, 1, lean, HANG_PIVOT);
 
   // Only the sitting cat can prick its ears: the airborne bodies are drawn
   // from a different height, and a cat dangling from a hand has other things
   // on its mind than what you just said.
   if (pose.earsUp && pose.posture === "sit") {
-    stamp(buf, rgb, EARS_PERKED.grid, cx + EARS_PERKED.ox, cy + EARS_PERKED.oy);
+    stamp(cat, rgb, EARS_PERKED.grid, cx + EARS_PERKED.ox, cy + EARS_PERKED.oy);
   }
 
-  stamp(buf, rgb, FACE.grid, cx + FACE.ox, cy + FACE.oy);
-  if (pose.bigBlush) stamp(buf, rgb, BLUSH_BIG.grid, cx + BLUSH_BIG.ox, cy + BLUSH_BIG.oy);
+  stamp(cat, rgb, FACE.grid, cx + FACE.ox, cy + FACE.oy);
+  if (pose.bigBlush) stamp(cat, rgb, BLUSH_BIG.grid, cx + BLUSH_BIG.ox, cy + BLUSH_BIG.oy);
 
   const eyes =
     pose.eyes === "open" ? EYES_OPEN : pose.eyes === "closed" ? EYES_CLOSED : EYES_HAPPY;
-  stamp(buf, rgb, eyes.grid, cx + eyes.ox + pose.gaze, cy + eyes.oy + pose.gazeY);
+  stamp(cat, rgb, eyes.grid, cx + eyes.ox + pose.gaze, cy + eyes.oy + pose.gazeY);
 
-  if (yarn) stamp(buf, rgb, yarn.grid, Math.round(yarn.x), Math.round(yarn.y), yarn.alpha);
+  if (yarn && !turning) {
+    stamp(cat, rgb, yarn.grid, Math.round(yarn.x), Math.round(yarn.y), yarn.alpha);
+  }
 
-  if (pose.groomPaw === "up") stamp(buf, rgb, PAW_UP.grid, cx + PAW_UP.ox, cy + PAW_UP.oy);
-  if (pose.groomPaw === "down") stamp(buf, rgb, PAW_DOWN.grid, cx + PAW_DOWN.ox, cy + PAW_DOWN.oy);
+  if (pose.groomPaw === "up") stamp(cat, rgb, PAW_UP.grid, cx + PAW_UP.ox, cy + PAW_UP.oy);
+  if (pose.groomPaw === "down") stamp(cat, rgb, PAW_DOWN.grid, cx + PAW_DOWN.ox, cy + PAW_DOWN.oy);
 
-  if (pose.playPaw === "ready") stamp(buf, rgb, PAW_READY.grid, cx + PAW_READY.ox, cy + PAW_READY.oy);
-  if (pose.playPaw === "swat") stamp(buf, rgb, PAW_SWAT.grid, cx + PAW_SWAT.ox, cy + PAW_SWAT.oy);
+  if (pose.playPaw === "ready") stamp(cat, rgb, PAW_READY.grid, cx + PAW_READY.ox, cy + PAW_READY.oy);
+  if (pose.playPaw === "swat") stamp(cat, rgb, PAW_SWAT.grid, cx + PAW_SWAT.ox, cy + PAW_SWAT.oy);
+
+  if (turning) {
+    const [ox, oy] = pivotOf(body);
+    turn(buf, cat, cx + ox, cy + oy, pose.spin);
+  }
 
   for (const p of particles) {
     stamp(buf, rgb, p.grid, Math.round(p.x), Math.round(p.y), p.alpha);
@@ -281,6 +404,7 @@ export const IDLE_POSE: CatPose = {
   lean: 0,
   bob: 0,
   lift: 0,
+  spin: 0,
   groomPaw: "none",
   playPaw: "none",
   bigBlush: false,

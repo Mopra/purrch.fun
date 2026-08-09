@@ -75,7 +75,8 @@ impl Adapter for ClaudeAdapter {
             None => {
                 // Pre-seeding the id means we can resume even if the turn dies
                 // before the init event lands.
-                cmd.arg("--session-id").arg(uuid::Uuid::new_v4().to_string());
+                cmd.arg("--session-id")
+                    .arg(uuid::Uuid::new_v4().to_string());
             }
         }
 
@@ -102,10 +103,7 @@ impl Adapter for ClaudeAdapter {
                         .to_string();
                     out.push(BridgeEvent::Started {
                         session,
-                        model: v
-                            .get("model")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
+                        model: v.get("model").and_then(Value::as_str).map(str::to_string),
                     });
                 }
             }
@@ -206,8 +204,15 @@ impl Adapter for ClaudeAdapter {
              log in, or give the cat an API key from the panel."
                 .to_string()
         } else {
-            stderr.trim().chars().rev().take(400).collect::<String>()
-                .chars().rev().collect()
+            stderr
+                .trim()
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect()
         };
         Some(BridgeEvent::Failed {
             message: if hint.is_empty() {
@@ -240,7 +245,8 @@ mod tests {
         }
 
         // Hook chatter must not produce events.
-        let hook = r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup"}"#;
+        let hook =
+            r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup"}"#;
         assert!(a.parse(hook).is_empty());
 
         let result = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","duration_ms":1462}"#;
@@ -351,7 +357,10 @@ mod tests {
         // the entire bridge is built on.
         for auth in [Auth::Inherit, Auth::Subscription] {
             let args = args_for(&request(), auth);
-            assert!(!args.iter().any(|a| a == "--bare"), "{auth:?} passed --bare");
+            assert!(
+                !args.iter().any(|a| a == "--bare"),
+                "{auth:?} passed --bare"
+            );
             assert!(args.iter().any(|a| a == "--strict-mcp-config"));
         }
 

@@ -37,6 +37,35 @@ const MAX_GIFTS: usize = 40;
 /// door, not a transcript — the whole point is that it fits in a glance.
 const GIFT_TEXT_MAX: usize = 600;
 
+/// Steps kept per gift.
+///
+/// Enough to see what a chore actually did, capped so a runaway hunt can't
+/// turn the board into a log file. A hunt that goes past this says so rather
+/// than silently showing you the first sixty of four hundred.
+const MAX_TRAIL: usize = 60;
+
+/// One tool a cat picked up while it was out.
+///
+/// This is the part of a hunt nobody watched. The turn you ask for streams its
+/// tool calls into the panel where you can see them go by, and that visible
+/// feed is the only thing standing between the user and a silent action — but a
+/// chore firing at 09:00 has no panel open and no one reading it. Without this,
+/// "you can see what it did afterwards" was not true of the half of the app
+/// most likely to be steered by something it read.
+/// `default` on the serde side as well as the derive: a `Step` written by an
+/// older build, or one hand-edited out of shape, should cost that one line of
+/// the trail rather than the whole gift it belongs to.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Step {
+    pub tool: String,
+    /// The one-line summary the bridge already builds for the speech bubble.
+    pub detail: String,
+    /// `None` while it was still running — which is how a hunt that died
+    /// mid-tool reads, and worth being able to tell apart from one that failed.
+    pub ok: Option<bool>,
+}
+
 /// A standing instruction handed to one cat.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -113,8 +142,11 @@ pub struct Gift {
     pub ok: bool,
     /// What the cat said it found. One or two lines, by the persona.
     pub text: String,
-    /// Tools it picked up getting there.
+    /// Tools it picked up getting there. Can exceed `trail.len()` — that's how
+    /// you know the trail was cut off at [`MAX_TRAIL`].
     pub tools: u32,
+    /// What it actually did, in order. See [`Step`].
+    pub trail: Vec<Step>,
     /// Whether you've looked at it yet. Unread gifts are the pile.
     pub read: bool,
 }
@@ -130,6 +162,7 @@ impl Default for Gift {
             ok: true,
             text: String::new(),
             tools: 0,
+            trail: Vec::new(),
             read: false,
         }
     }
@@ -253,12 +286,16 @@ impl Board {
     /// edit changes what the cat is asked to do, never what it has already
     /// done. Changing the interval re-slots it from now, so making a chore
     /// hourly doesn't leave it due on the old minute.
-    pub fn update(&self, id: &str, patch: &Value) -> Result<Chore, String> {
+    ///
+    /// `cat` is the window asking, and a chore that isn't its own is not
+    /// found — the same answer as a chore that doesn't exist. See
+    /// [`Board::mine`] for why that's the shape rather than a permission error.
+    pub fn update(&self, cat: &str, id: &str, patch: &Value) -> Result<Chore, String> {
         let Some(patch) = patch.as_object() else {
             return Err("a chore patch has to be an object".into());
         };
         let mut store = self.store.lock().unwrap();
-        let Some(slot) = store.chores.iter().position(|c| c.id == id) else {
+        let Some(slot) = store.chores.iter().position(|c| c.id == id && c.cat == cat) else {
             return Err("no such chore".into());
         };
         let before = store.chores[slot].clone();
@@ -295,10 +332,30 @@ impl Board {
         Ok(next)
     }
 
-    pub fn remove(&self, id: &str) {
+    pub fn remove(&self, cat: &str, id: &str) {
         let mut store = self.store.lock().unwrap();
-        store.chores.retain(|c| c.id != id);
-        write(&self.path, &store);
+        let before = store.chores.len();
+        store.chores.retain(|c| !(c.id == id && c.cat == cat));
+        if store.chores.len() != before {
+            write(&self.path, &store);
+        }
+    }
+
+    /// This cat's own copy of a chore, or `None` if the id belongs to a sibling.
+    ///
+    /// Every command a window can reach goes through here rather than through
+    /// [`Board::get`], which is the scheduler's unscoped view. Not a permission
+    /// check — nothing in Purrch is — but a cat's board is *its* board, and a
+    /// window that could rewrite another's would make the colony one shared
+    /// to-do list shown several times.
+    pub fn mine(&self, cat: &str, id: &str) -> Option<Chore> {
+        self.store
+            .lock()
+            .unwrap()
+            .chores
+            .iter()
+            .find(|c| c.id == id && c.cat == cat)
+            .cloned()
     }
 
     /// Advances the calendar to `now` and reports which chores should be hunted.
@@ -330,9 +387,9 @@ impl Board {
     }
 
     /// Brings a chore's next slot forward to now — the board's "run now".
-    pub fn nudge(&self, id: &str) {
+    pub fn nudge(&self, cat: &str, id: &str) {
         let mut store = self.store.lock().unwrap();
-        if let Some(chore) = store.chores.iter_mut().find(|c| c.id == id) {
+        if let Some(chore) = store.chores.iter_mut().find(|c| c.id == id && c.cat == cat) {
             chore.next_due = now_ms();
             write(&self.path, &store);
         }
@@ -369,8 +426,8 @@ impl Board {
         }
     }
 
-    /// Leaves what a cat caught by the door.
-    pub fn gift(&self, chore: &Chore, ok: bool, text: &str, tools: u32) -> Gift {
+    /// Leaves what a cat caught by the door, and the trail of how it got there.
+    pub fn gift(&self, chore: &Chore, ok: bool, text: &str, tools: u32, trail: &[Step]) -> Gift {
         let gift = Gift {
             id: uuid::Uuid::new_v4().to_string(),
             cat: chore.cat.clone(),
@@ -380,6 +437,13 @@ impl Board {
             ok,
             text: clip(text),
             tools,
+            // The tail rather than the head: a hunt that ran long went wrong
+            // near the end, and what it did last is what you want to see.
+            trail: trail
+                .iter()
+                .skip(trail.len().saturating_sub(MAX_TRAIL))
+                .cloned()
+                .collect(),
             read: false,
         };
         let mut store = self.store.lock().unwrap();
@@ -474,7 +538,7 @@ mod tests {
         let chore = board.add("main", draft(10_000));
         assert_eq!(chore.every_ms, MIN_EVERY_MS);
         let patched = board
-            .update(&chore.id, &json!({ "everyMs": 1000 }))
+            .update("main", &chore.id, &json!({ "everyMs": 1000 }))
             .unwrap();
         assert_eq!(patched.every_ms, MIN_EVERY_MS);
     }
@@ -519,7 +583,7 @@ mod tests {
         let board = Board::load(&scratch());
         let chore = board.add("main", draft(MIN_EVERY_MS));
         board
-            .update(&chore.id, &json!({ "enabled": false }))
+            .update("main", &chore.id, &json!({ "enabled": false }))
             .unwrap();
         assert!(board.due(chore.next_due + MIN_EVERY_MS).is_empty());
     }
@@ -528,7 +592,7 @@ mod tests {
     fn run_now_brings_a_chore_forward() {
         let board = Board::load(&scratch());
         let chore = board.add("main", draft(MIN_EVERY_MS));
-        board.nudge(&chore.id);
+        board.nudge("main", &chore.id);
         assert_eq!(board.due(now_ms()), vec![chore.id]);
     }
 
@@ -540,6 +604,7 @@ mod tests {
 
         let patched = board
             .update(
+                "main",
                 &chore.id,
                 &json!({ "name": "watch the other inbox", "runs": 999, "cat": "cat-9" }),
             )
@@ -556,12 +621,18 @@ mod tests {
         board.finished(&chore.id, Some("session-1".into()));
 
         // A cosmetic edit keeps its continuity...
-        let renamed = board.update(&chore.id, &json!({ "name": "mail" })).unwrap();
+        let renamed = board
+            .update("main", &chore.id, &json!({ "name": "mail" }))
+            .unwrap();
         assert_eq!(renamed.session.as_deref(), Some("session-1"));
 
         // ...but asking for something else entirely does not.
         let rewritten = board
-            .update(&chore.id, &json!({ "prompt": "tidy the downloads folder" }))
+            .update(
+                "main",
+                &chore.id,
+                &json!({ "prompt": "tidy the downloads folder" }),
+            )
             .unwrap();
         assert_eq!(rewritten.session, None);
     }
@@ -575,15 +646,48 @@ mod tests {
         assert_eq!(board.for_cat("cat-1").len(), 1);
     }
 
+    /// ...and a cat holding a sibling's id can do nothing with it. What makes
+    /// the colony a colony rather than one shared list shown several times.
+    #[test]
+    fn one_cat_cannot_touch_anothers_board() {
+        let board = Board::load(&scratch());
+        let theirs = board.add("cat-1", draft(MIN_EVERY_MS));
+        let due_at = theirs.next_due;
+
+        assert!(board.mine("main", &theirs.id).is_none());
+        assert!(board.mine("cat-1", &theirs.id).is_some());
+
+        // An edit is refused rather than quietly applied to somebody else's.
+        assert!(board
+            .update("main", &theirs.id, &json!({ "name": "mine now" }))
+            .is_err());
+        assert_eq!(board.get(&theirs.id).unwrap().name, "watch the inbox");
+
+        // A delete does nothing at all...
+        board.remove("main", &theirs.id);
+        assert_eq!(board.for_cat("cat-1").len(), 1);
+
+        // ...and neither does dragging its slot forward.
+        board.nudge("main", &theirs.id);
+        assert_eq!(board.get(&theirs.id).unwrap().next_due, due_at);
+
+        // The owner is still free to do all three.
+        assert!(board
+            .update("cat-1", &theirs.id, &json!({ "name": "mail" }))
+            .is_ok());
+        board.remove("cat-1", &theirs.id);
+        assert!(board.for_cat("cat-1").is_empty());
+    }
+
     #[test]
     fn gifts_pile_up_newest_first_and_stay_the_cats_own() {
         let board = Board::load(&scratch());
         let mine = board.add("main", draft(MIN_EVERY_MS));
         let theirs = board.add("cat-1", draft(MIN_EVERY_MS));
 
-        board.gift(&mine, true, "nothing new", 2);
-        board.gift(&mine, true, "three PRs reviewed", 9);
-        board.gift(&theirs, false, "couldn't reach GitHub", 1);
+        board.gift(&mine, true, "nothing new", 2, &[]);
+        board.gift(&mine, true, "three PRs reviewed", 9, &[]);
+        board.gift(&theirs, false, "couldn't reach GitHub", 1, &[]);
 
         let pile = board.gifts_for("main");
         assert_eq!(pile.len(), 2);
@@ -596,9 +700,9 @@ mod tests {
         let board = Board::load(&scratch());
         let quiet = board.add("cat-1", draft(MIN_EVERY_MS));
         let busy = board.add("main", draft(MIN_EVERY_MS));
-        board.gift(&quiet, true, "one for later", 0);
+        board.gift(&quiet, true, "one for later", 0, &[]);
         for i in 0..MAX_GIFTS + 10 {
-            board.gift(&busy, true, &format!("catch {i}"), 0);
+            board.gift(&busy, true, &format!("catch {i}"), 0, &[]);
         }
         assert_eq!(board.gifts_for("cat-1").len(), 1);
         let pile = board.gifts_for("main");
@@ -607,11 +711,73 @@ mod tests {
         assert_eq!(pile[0].text, format!("catch {}", MAX_GIFTS + 9));
     }
 
+    /// The record of an unwatched turn. Nobody saw the tool feed go by, so if
+    /// this doesn't land there is no answer to "what did it actually do".
+    #[test]
+    fn a_gift_carries_the_trail_of_what_the_cat_did() {
+        let board = Board::load(&scratch());
+        let chore = board.add("main", draft(MIN_EVERY_MS));
+        let trail = vec![
+            Step {
+                tool: "Bash".into(),
+                detail: "gh pr list".into(),
+                ok: Some(true),
+            },
+            Step {
+                tool: "Write".into(),
+                detail: "C:\\notes\\prs.md".into(),
+                ok: Some(false),
+            },
+            // Still open: the hunt died holding this one.
+            Step {
+                tool: "WebFetch".into(),
+                detail: "https://example.invalid".into(),
+                ok: None,
+            },
+        ];
+
+        let gift = board.gift(&chore, true, "three PRs reviewed", 3, &trail);
+        assert_eq!(gift.trail.len(), 3);
+        assert_eq!(gift.trail[0].detail, "gh pr list");
+        assert_eq!(gift.trail[1].ok, Some(false));
+        assert_eq!(gift.trail[2].ok, None);
+
+        // ...and it survives the trip through the store, which is the only
+        // reason it's worth keeping at all.
+        let kept = &board.gifts_for("main")[0];
+        assert_eq!(kept.trail.len(), 3);
+        assert_eq!(kept.trail[2].tool, "WebFetch");
+    }
+
+    #[test]
+    fn a_long_hunt_keeps_the_end_of_its_trail_and_says_how_much_it_did() {
+        let board = Board::load(&scratch());
+        let chore = board.add("main", draft(MIN_EVERY_MS));
+        let trail: Vec<Step> = (0..MAX_TRAIL + 25)
+            .map(|i| Step {
+                tool: "Bash".into(),
+                detail: format!("step {i}"),
+                ok: Some(true),
+            })
+            .collect();
+
+        let gift = board.gift(&chore, true, "busy morning", trail.len() as u32, &trail);
+        assert_eq!(gift.trail.len(), MAX_TRAIL);
+        // The tail, not the head — a hunt that ran long went wrong near the end.
+        assert_eq!(gift.trail[0].detail, format!("step {}", 25));
+        assert_eq!(
+            gift.trail[MAX_TRAIL - 1].detail,
+            format!("step {}", MAX_TRAIL + 24)
+        );
+        // And the count still tells you the trail isn't the whole story.
+        assert!(gift.tools as usize > gift.trail.len());
+    }
+
     #[test]
     fn a_gift_is_what_fits_by_the_door() {
         let board = Board::load(&scratch());
         let chore = board.add("main", draft(MIN_EVERY_MS));
-        let gift = board.gift(&chore, true, &"x".repeat(5000), 0);
+        let gift = board.gift(&chore, true, &"x".repeat(5000), 0, &[]);
         assert_eq!(gift.text.chars().count(), GIFT_TEXT_MAX);
     }
 
@@ -619,10 +785,10 @@ mod tests {
     fn reading_and_sweeping_the_pile() {
         let board = Board::load(&scratch());
         let chore = board.add("main", draft(MIN_EVERY_MS));
-        let a = board.gift(&chore, true, "one", 0);
-        board.gift(&chore, true, "two", 0);
+        let a = board.gift(&chore, true, "one", 0, &[]);
+        board.gift(&chore, true, "two", 0, &[]);
 
-        board.read("main", &[a.id.clone()]);
+        board.read("main", std::slice::from_ref(&a.id));
         let pile = board.gifts_for("main");
         assert_eq!(pile.iter().filter(|g| !g.read).count(), 1);
 
@@ -639,8 +805,8 @@ mod tests {
         // un-happen it, and the gift carries the name it had at the time.
         let board = Board::load(&scratch());
         let chore = board.add("main", draft(MIN_EVERY_MS));
-        board.gift(&chore, true, "one email needed you", 4);
-        board.remove(&chore.id);
+        board.gift(&chore, true, "one email needed you", 4, &[]);
+        board.remove("main", &chore.id);
 
         assert!(board.for_cat("main").is_empty());
         let pile = board.gifts_for("main");
@@ -654,7 +820,7 @@ mod tests {
         let id = {
             let board = Board::load(&dir);
             let chore = board.add("main", draft(MIN_EVERY_MS));
-            board.gift(&chore, true, "nothing new", 1);
+            board.gift(&chore, true, "nothing new", 1, &[]);
             chore.id
         };
         let board = Board::load(&dir);

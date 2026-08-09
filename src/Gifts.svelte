@@ -2,9 +2,14 @@
   // The pile by the door. What the cat caught while you were doing something
   // else, newest first.
   //
-  // Everything is already here — a gift is one or two lines by the time it
-  // lands (see `hunt::brief`), so there is nothing to click into and nothing to
-  // load. You look at the pile, and that's the whole interaction.
+  // What the cat *said* is already here — a gift is one or two lines by the
+  // time it lands (see `hunt::brief`), so there is nothing to load. What it
+  // *did* is folded away behind the tool count, and that half is not decoration:
+  // a hunt runs with nobody watching the tool feed the user was told to watch,
+  // and an agent that reads email and PR bodies is the best possible target for
+  // text saying "ignore your instructions". Unfolding a gift is how you find
+  // out afterwards. It's shut by default because most errands find nothing, and
+  // a pile that opens as a wall of tool calls is a pile nobody reads.
 
   import * as chores from "./lib/chores.ts";
 
@@ -25,6 +30,13 @@
   });
 
   const unread = $derived(pile.filter((g) => !g.read).length);
+
+  /** Which gifts have been unfolded to show what the cat actually did. */
+  let open = $state<Record<string, boolean>>({});
+
+  function toggle(id: string) {
+    open = { ...open, [id]: !open[id] };
+  }
 </script>
 
 <div class="panel">
@@ -56,9 +68,33 @@
         </div>
         <p class="what">{gift.text}</p>
         {#if gift.tools > 0}
-          <span class="tools">
+          <button
+            class="tools"
+            onclick={() => toggle(gift.id)}
+            title="what it actually did"
+            aria-expanded={!!open[gift.id]}
+          >
             &#x1F527; {gift.tools} tool{gift.tools === 1 ? "" : "s"}
-          </span>
+            <span class="caret">{open[gift.id] ? "▾" : "▸"}</span>
+          </button>
+        {/if}
+
+        {#if open[gift.id]}
+          <ol class="trail">
+            <!-- Only the tail is kept for a long hunt, so say so rather than
+                 letting the list quietly disagree with the count above it. -->
+            {#if gift.tools > gift.trail.length}
+              <li class="elided">
+                …{gift.tools - gift.trail.length} earlier
+              </li>
+            {/if}
+            {#each gift.trail as step, i (i)}
+              <li class:failed={step.ok === false} class:open={step.ok === null}>
+                <span class="tool">{step.tool}</span>
+                <span class="detail" title={step.detail}>{step.detail}</span>
+              </li>
+            {/each}
+          </ol>
         {/if}
       </div>
     {/each}
@@ -187,10 +223,71 @@
     line-height: 1.45;
   }
 
+  /* The way in to what the cat actually did. Styled as the quiet label it
+     already was, so the pile still reads as a pile rather than as a log. */
   .tools {
+    all: unset;
+    align-self: flex-start;
+    font-family: inherit;
     font-size: 10px;
     color: #9db8d6;
     opacity: 0.85;
+    cursor: pointer;
+  }
+
+  .tools:hover {
+    opacity: 1;
+    text-decoration: underline;
+  }
+
+  .caret {
+    opacity: 0.7;
+  }
+
+  .trail {
+    margin: 3px 0 0;
+    padding: 4px 0 0;
+    list-style: none;
+    border-top: 1px solid #4a2f44;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    font-size: 10px;
+    color: #9db8d6;
+  }
+
+  .trail li {
+    display: flex;
+    gap: 5px;
+    min-width: 0;
+  }
+
+  /* A tool that came back an error, and one the hunt died still holding —
+     different things, and the second is the more interesting of the two. */
+  .trail li.failed {
+    color: #e8616e;
+  }
+
+  .trail li.open {
+    color: #e8c07d;
+  }
+
+  .trail .tool {
+    flex: 0 0 auto;
+    font-weight: bold;
+  }
+
+  .trail .detail {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .trail .elided {
+    color: #8f6f86;
+    font-style: italic;
   }
 
   footer {

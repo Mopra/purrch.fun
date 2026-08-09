@@ -308,14 +308,16 @@ fn understand(
             let wav = PathBuf::from(wav);
             if whisper::ready(&dir) {
                 match whisper::transcribe(&dir, &wav).await {
-                    Ok(said) => {
-                        let command = undress(&said, &name);
-                        if !command.is_empty() {
-                            text = command;
-                        }
-                    }
+                    // Taken whole, including when it comes back empty. If the
+                    // half of the ear that can actually hear read the
+                    // recording and found no words in it, there were none —
+                    // and falling back to SAPI's guess there means running
+                    // whatever the engine that already says "a" into silence
+                    // came up with. An empty command greets the cat; a
+                    // hallucinated one has it go and do something.
+                    Ok(said) => text = undress(&said, &name),
                     // Nothing the user can do about it, and they still have a
-                    // working — if dimmer — cat.
+                    // working — if dimmer — cat, so SAPI's guess stands.
                     Err(why) => eprintln!("purrch: couldn't transcribe: {why}"),
                 }
             }
@@ -364,6 +366,11 @@ fn open(app: AppHandle, dir: PathBuf, roster: Vec<Listener>, stop: Arc<Notify>) 
         // Which cat has already sat up for the utterance being spoken now, so
         // a stream of guesses at the same sentence perks it once.
         let mut perked: Option<String> = None;
+        // Which cat was called by name and is still owed the rest of the
+        // sentence. The ear has a bare-dictation grammar open for exactly as
+        // long as this is set, and whatever it catches belongs to this cat —
+        // there is no name on the front of it to route by.
+        let mut awaiting: Option<Listener> = None;
         let mut said_why = false;
 
         loop {
@@ -387,24 +394,55 @@ fn open(app: AppHandle, dir: PathBuf, roster: Vec<Listener>, stop: Arc<Notify>) 
                                 }
                             }
                         }
-                        Word::Heard { text, confidence, audio } => {
+                        // The rest of a sentence that started with a name a
+                        // moment ago. It carries no name of its own, so it
+                        // goes to whoever is still owed one — and to nobody at
+                        // all if that window has already closed.
+                        Word::Heard { text, audio, follow: true, .. } => {
                             perked = None;
+                            let Some(cat) = awaiting.take() else {
+                                if let Some(wav) = audio { let _ = std::fs::remove_file(wav); }
+                                continue;
+                            };
+                            // No confidence gate here, unlike below. That one
+                            // is a judgement about a wake phrase, and there
+                            // isn't one: this window was opened by the user
+                            // deliberately calling a cat, and what was said
+                            // into it is whisper's to read.
+                            understand(app.clone(), dir.clone(), cat.label, cat.name, text, audio);
+                        }
+                        Word::Heard { text, confidence, audio, waiting, .. } => {
+                            perked = None;
+                            awaiting = None;
                             if confidence < SURE_ENOUGH {
                                 if let Some(wav) = audio { let _ = std::fs::remove_file(wav); }
                                 continue;
                             }
                             match hear(&text, &roster) {
                                 Some((label, fallback)) => {
-                                    let name = roster
+                                    let cat = roster
                                         .iter()
                                         .find(|c| c.label == label)
-                                        .map(|c| c.name.clone())
-                                        .unwrap_or_default();
+                                        .cloned()
+                                        .unwrap_or_else(|| Listener {
+                                            label: label.clone(),
+                                            name: String::new(),
+                                        });
+                                    // Called and nothing else. The ear is
+                                    // holding a window open for the rest, so
+                                    // the cat sits up and waits rather than
+                                    // being handed an empty command.
+                                    if waiting {
+                                        let _ = app.emit_to(&label, EVENT, EarEvent::Perked);
+                                        perked = Some(label);
+                                        awaiting = Some(cat);
+                                        continue;
+                                    }
                                     understand(
                                         app.clone(),
                                         dir.clone(),
-                                        label,
-                                        name,
+                                        cat.label,
+                                        cat.name,
                                         fallback,
                                         audio,
                                     );
@@ -416,7 +454,26 @@ fn open(app: AppHandle, dir: PathBuf, roster: Vec<Listener>, stop: Arc<Notify>) 
                                 }
                             }
                         }
+                        // The window closed with nothing said into it. Being
+                        // called and left at that is being greeted, which is
+                        // what an empty command means to a cat.
+                        Word::Unanswered => {
+                            perked = None;
+                            if let Some(cat) = awaiting.take() {
+                                let _ = app.emit_to(
+                                    &cat.label,
+                                    EVENT,
+                                    EarEvent::Heard { text: String::new() },
+                                );
+                            }
+                        }
                         Word::Missed => {
+                            // Not while a cat is still waiting to be told what
+                            // to do: its ears must not drop halfway through
+                            // the pause it was opened for.
+                            if awaiting.is_some() {
+                                continue;
+                            }
                             if let Some(label) = perked.take() {
                                 let _ = app.emit_to(&label, EVENT, EarEvent::Missed);
                             }

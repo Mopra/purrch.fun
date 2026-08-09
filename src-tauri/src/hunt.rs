@@ -12,19 +12,30 @@
 //! 2. **Nobody is watching.** A hunt has no panel open and no one reading its
 //!    output, so what it did has to survive the moment. It streams to the
 //!    window on its own channel — that's the cat you see padding across the
-//!    taskbar — and what it comes back with is written down as a gift.
+//!    taskbar — and both what it comes back with *and every tool it picked up
+//!    on the way* are written down as a gift. The tool feed is what the user
+//!    was told to watch; a turn nobody watched has to keep its own.
 //!
-//! The burn this implies is real and unsolved: every hunt spends the user's
-//! subscription in the background, and they find out when their own session
-//! hits a wall. What's here is the cheap half of an answer — a floor on how
-//! often a chore may fire ([`chores::MIN_EVERY_MS`]), a run count on the board,
-//! missed slots dropped rather than replayed, and a cat that yields the moment
-//! you start typing. The rest is still open.
+//! The burn this implies is the reason a hunt is not simply a turn. Every one
+//! spends the user's subscription in the background, and they find out when
+//! their own session hits a wall in the afternoon. What bounds it:
+//!
+//! * a floor on how often a chore may fire ([`chores::MIN_EVERY_MS`]),
+//! * a ceiling on how many hunts a cat may run in a rolling day
+//!   ([`crate::colony`]), charged here and refused rather than queued,
+//! * missed slots dropped rather than replayed,
+//! * a run count on every row, and the day's spend on the board,
+//! * and a cat that yields the moment you start typing.
+//!
+//! Still not here: a cheap "did anything change?" pre-check that could wake the
+//! expensive cat only when it needs waking, and any notion of how close the
+//! user's *own* session is to a limit. Both would make the cap less blunt.
 
 use crate::bridge::detect;
 use crate::bridge::session::{self, BridgeState, Hunt, Outcome};
-use crate::bridge::{has_adapter, TurnRequest};
-use crate::chores::{Board, Chore, Gift};
+use crate::bridge::TurnRequest;
+use crate::chores::{Board, Chore, Gift, Step};
+use crate::colony::Colony;
 use crate::memory::{now_ms, Memory};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -184,13 +195,29 @@ pub fn start(app: AppHandle) {
 fn sweep(app: &AppHandle) {
     let board = app.state::<Arc<Board>>().inner().clone();
     let hunts = app.state::<Arc<Hunts>>().inner().clone();
+    let colony = app.state::<Arc<Colony>>().inner().clone();
+
+    // Nothing acts unasked until the user has said it may. Checked before the
+    // calendar is even read, so an unleashed colony's chores don't quietly
+    // advance their slots in the background either.
+    if !colony.unleashed() {
+        return;
+    }
 
     for id in board.due(now_ms()) {
-        let Some(chore) = board.get(&id) else { continue };
+        let Some(chore) = board.get(&id) else {
+            continue;
+        };
         // A chore belongs to a cat, and a cat that isn't on the desktop isn't
         // there to do it. The slot has already been advanced, so this is a
         // miss rather than a backlog.
         if app.get_webview_window(&chore.cat).is_none() {
+            continue;
+        }
+        // A cat that has spent its day doesn't get a queue full of errands it
+        // will only be refused for. The slot is gone either way — this is a
+        // miss, like being asleep through it.
+        if colony.spend(&chore.cat).spent_out() {
             continue;
         }
         hunts.queue(&chore.cat, &id);
@@ -236,15 +263,14 @@ pub fn pump(app: &AppHandle, cat: &str) {
 /// The one it was last thinking with, as long as that's still installed and
 /// driveable — otherwise anything that is. A hunt has nobody to ask.
 fn brain(remembered: Option<&str>) -> Option<String> {
-    let installed = detect::detect_all();
-    let driveable = |id: &str| installed.iter().any(|b| b.id == id) && has_adapter(id);
-    if let Some(id) = remembered.filter(|id| driveable(id)) {
+    // `backends` is already only what has an adapter, so nothing here has to
+    // re-check that — a hunt has nobody to ask and must not pick a CLI that
+    // would die at spawn time.
+    let installed = detect::detect_all().backends;
+    if let Some(id) = remembered.filter(|id| installed.iter().any(|b| &b.id == id)) {
         return Some(id.to_string());
     }
-    installed
-        .into_iter()
-        .find(|b| has_adapter(&b.id))
-        .map(|b| b.id)
+    installed.into_iter().next().map(|b| b.id)
 }
 
 /// What the cat is actually told, which is the chore plus the fact that it's a
@@ -268,11 +294,49 @@ fn brief(chore: &Chore) -> String {
     )
 }
 
+/// Whether a failed turn reads like "the conversation you asked me to resume
+/// isn't here any more" rather than like the chore itself being broken.
+///
+/// Deliberately a text match, because that is all the CLIs give us — they exit
+/// with a message and no code that distinguishes the two. Wrong in the
+/// forgiving direction: an unrecognised error simply isn't retried, which costs
+/// one slot rather than doubling every slot forever.
+fn lost_session(error: &str) -> bool {
+    let said = error.to_ascii_lowercase();
+    const GONE: &[&str] = &[
+        "no such session",
+        "session not found",
+        "no conversation",
+        "conversation not found",
+        "could not resume",
+        "couldn't resume",
+        "unable to resume",
+        "no session with id",
+        "invalid session",
+        "unknown session",
+        "no thread",
+        "thread not found",
+    ];
+    GONE.iter().any(|hint| said.contains(hint))
+}
+
 /// Runs one hunt and leaves whatever it caught by the door.
 async fn run(app: AppHandle, cat: String, chore: Chore, live: Live) {
     let memory = app.state::<Arc<Memory>>().inner().clone();
     let board = app.state::<Arc<Board>>().inner().clone();
     let hunts = app.state::<Arc<Hunts>>().inner().clone();
+    let colony = app.state::<Arc<Colony>>().inner().clone();
+
+    // The last gate before anything is spawned, and the one that has to be
+    // atomic: `sweep` already declined to queue a spent-out cat, but two chores
+    // claimed in the same tick would both have seen the same free slot.
+    //
+    // A refusal leaves no gift. The board says what the cat has spent and when
+    // it can go again — a pile of "I was too tired" notes every hour would bury
+    // the ones that are actually worth reading.
+    if colony.charge(&cat).is_err() {
+        return;
+    }
 
     let past = memory.peek(&cat).unwrap_or_default();
     let Some(backend) = brain(past.backend.as_deref()) else {
@@ -284,6 +348,7 @@ async fn run(app: AppHandle, cat: String, chore: Chore, live: Live) {
             false,
             "no agent CLI I can drive is installed",
             0,
+            &[],
         );
         return;
     };
@@ -309,7 +374,15 @@ async fn run(app: AppHandle, cat: String, chore: Chore, live: Live) {
     // The remembered conversation may be gone — agent CLIs prune transcripts,
     // and they're stored per working directory. Start over rather than letting
     // a chore fail every hour forever over a session id from last week.
-    if outcome.error.is_some() && chore.session.is_some() && outcome.tools == 0 {
+    //
+    // Only for an error that actually reads like a missing session, though: a
+    // chore that is simply broken would otherwise burn two turns every slot
+    // instead of one, and the chores most likely to fail without touching a
+    // tool are exactly the ones that fail every time.
+    if chore.session.is_some()
+        && outcome.tools == 0
+        && outcome.error.as_deref().is_some_and(lost_session)
+    {
         board.forget_session(&chore.id);
         outcome = turn(&app, &cat, request(None), &tag).await;
     }
@@ -335,7 +408,16 @@ async fn run(app: AppHandle, cat: String, chore: Chore, live: Live) {
                 "the hunt ended badly and didn't say why".to_string()
             }
         });
-    drop_gift(&app, &board, &chore, &live, ok, &text, outcome.tools);
+    drop_gift(
+        &app,
+        &board,
+        &chore,
+        &live,
+        ok,
+        &text,
+        outcome.tools,
+        &outcome.trail,
+    );
 }
 
 /// One attempt, with a failure to even start turned into the same shape as a
@@ -343,7 +425,10 @@ async fn run(app: AppHandle, cat: String, chore: Chore, live: Live) {
 /// that goes quiet without ending would leave the cat working forever.
 async fn turn(app: &AppHandle, cat: &str, request: TurnRequest, tag: &Hunt) -> Outcome {
     let state = app.state::<Arc<BridgeState>>().inner().clone();
-    let creds = app.state::<Arc<crate::bridge::creds::Creds>>().inner().clone();
+    let creds = app
+        .state::<Arc<crate::bridge::creds::Creds>>()
+        .inner()
+        .clone();
 
     match session::run(
         app.clone(),
@@ -374,6 +459,7 @@ async fn turn(app: &AppHandle, cat: &str, request: TurnRequest, tag: &Hunt) -> O
 }
 
 /// Leaves the gift on the doorstep and tells the cat's window about it.
+#[allow(clippy::too_many_arguments)]
 fn drop_gift(
     app: &AppHandle,
     board: &Board,
@@ -382,8 +468,9 @@ fn drop_gift(
     ok: bool,
     text: &str,
     tools: u32,
+    trail: &[Step],
 ) {
-    let gift: Gift = board.gift(chore, ok, text, tools);
+    let gift: Gift = board.gift(chore, ok, text, tools, trail);
     let _ = app.emit_to(
         &chore.cat,
         GIFT_EVENT,
@@ -492,7 +579,7 @@ mod tests {
 
         hunts.queue("main", &gone.id);
         hunts.queue("main", &kept.id);
-        board.remove(&gone.id);
+        board.remove("main", &gone.id);
 
         let (taken, _) = hunts.claim("main", &board).unwrap();
         assert_eq!(taken.id, kept.id);
@@ -519,6 +606,29 @@ mod tests {
         assert!(hunts.status("cat-1").live.is_none());
         assert_eq!(hunts.status("cat-1").waiting, 0);
         assert!(hunts.active().is_empty());
+    }
+
+    /// The retry exists for one failure and must not fire on the others: a
+    /// chore that is simply broken would burn two turns every slot forever.
+    #[test]
+    fn only_a_lost_conversation_is_worth_starting_over_for() {
+        for gone in [
+            "No such session: abc-123",
+            "error: could not resume conversation",
+            "Thread not found",
+            "Invalid session id",
+        ] {
+            assert!(lost_session(gone), "should have been retried: {gone}");
+        }
+        for real in [
+            "Invalid API key · Please run /login",
+            "rate limit exceeded, try again in 4 minutes",
+            "ENOENT: no such file or directory, open 'C:\\gone'",
+            "claude exited with status 1",
+            "",
+        ] {
+            assert!(!lost_session(real), "should not have been retried: {real}");
+        }
     }
 
     #[test]

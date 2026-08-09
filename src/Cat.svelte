@@ -226,6 +226,41 @@
   const SWING_MAX = 4;
   const LIMP_TICKS = 2; // beats after release before it twists itself upright
 
+  // --- being spun ---
+  //
+  // Swing the cat around hard enough and the pendulum goes over the top: the
+  // dangle becomes a tumble, and the tumble carries on after you let go.
+  //
+  // Deliberately hard to do by accident. Winding up is invisible — the whirl
+  // pours into `spinV` and leaks straight back out of it, and until it clears
+  // `SPIN_TRIP` none of it shows at all. Everything below that is the cat that
+  // was here before: dragged, dangling, swinging on its scruff. One circular
+  // flourish on the way across the desk won't do it. Two fast laps will.
+  //
+  // What's measured is not where the pointer is but how much its own direction
+  // of travel is *turning*, so hauling the cat flat across the desk — however
+  // fast — never spins it, whatever else it does.
+  //
+  // Once it's up there it always lands on its feet. Not as a rule bolted on
+  // top but the way a cat does it: given any air at all it twists, and it
+  // spends whatever it has left arriving square. `touchdown` is the backstop
+  // for drops too short to twist in — the floor is the last word on which way
+  // up a cat is.
+  const TAU = Math.PI * 2;
+  const SPIN_GAIN = 1.6; // rad/s of wind-up per radian the pointer turns through
+  const SPIN_DRAG = 1.4; // ...and how much of that leaks back out, per second
+  const SPIN_TRIP = 10; // rad/s of wind-up that finally takes it over the top
+  const SPIN_MAX = 18; // rad/s — getting on for three turns a second, flat out
+  const SPIN_REST = 2; // rad/s under which a cat in the hand stops going round
+  const SPIN_TRUE = 4; // ...and how briskly it then straightens back out, /s
+  const SPIN_STOP = 0.02; // below this it isn't turning, it's arithmetic
+  const SPIN_STEP = 1.5; // CSS px a pointer move must cover to count as a whirl
+  const SPIN_ARC = Math.PI / 2; // ...and the most it can bend by and still be one
+  const RIGHT_DUR = 0.32; // seconds out from the floor the righting takes over
+  const RIGHT_MIN = 0.14; // ...or, with no fall to time it against, this long
+  const RIGHT_LAP = 0.15; // rad of doubling back worth finishing the turn over
+  const RIGHT_RATE = 28; // rad/s the twist itself will never exceed
+
   /** Every monitor, refreshed on the same beat as the ground line. */
   let world: perch.Perch | null = null;
   /** Limits for the monitor the cat is on right now. */
@@ -245,6 +280,20 @@
   let carriedDX = 0; // pointer travel since the last art tick, in CSS px
   let walkDir: 1 | -1 = -1;
   let homeX = 0; // centre of the pacing range
+  let spin = 0; // radians the cat is turned by, right now
+  let spinV = 0; // wind-up: latent below SPIN_TRIP, rad/s of turn above it
+  let spinning = false; // ...whether it went over the top and is going round
+  let spinIn = 0; // radians the pointer has turned through since the last frame
+  let whirlX = 0; // the pointer's last direction of travel, to measure the turn
+  let whirlY = 0;
+  // The righting reflex, once it has started: a curve the spin is pinned to
+  // for its last fraction of a second, and the clock it is read against.
+  let righting = false;
+  let rightFrom = 0;
+  let rightTo = 0;
+  let rightV = 0;
+  let rightDur = 0;
+  let rightAt = 0;
 
   function clamp(v: number, lo: number, hi: number): number {
     return v < lo ? lo : v > hi ? hi : v;
@@ -322,6 +371,16 @@
   }
 
   /**
+   * True while the cat is actually going round. Deliberately says nothing
+   * about wind-up: a cat being swung about below the tipping point is just a
+   * cat being carried, and every drag that never gets there behaves exactly as
+   * it did before any of this existed.
+   */
+  function spun(): boolean {
+    return spinning || spin !== 0 || righting;
+  }
+
+  /**
    * Feet down. A drop from height folds the cat into the floor and knocks the
    * dust out from under it; a pounce just bends the knees on the way back up.
    */
@@ -336,6 +395,15 @@
     limp = 0;
     swing = 0;
     swingV = 0;
+    // However the tumble was going, the floor settles it. The righting reflex
+    // above is what makes this land square rather than snap square, but a cat
+    // dropped from two inches up has no time to twist, and it still gets to be
+    // a cat that lands on its feet.
+    spin = 0;
+    spinV = 0;
+    spinIn = 0;
+    spinning = false;
+    righting = false;
   }
 
   /** The in-canvas hop, on the art tick so it stays in step with the pixels. */
@@ -368,10 +436,141 @@
       carriedDX = 0;
       return;
     }
+    // Once it's over the top there is nothing left to throw: the body isn't
+    // hanging under the hand any more, it's going round it. Only then — a cat
+    // being swung about below that is still a cat on the end of a scruff, and
+    // the pendulum is the whole point of it. The spring stays wired up
+    // regardless, so it's also what settles the dangle back out afterwards.
+    if (spinning) carriedDX = 0;
     swingV += -swing * SWING_K - clamp(carriedDX, -SWING_TOP, SWING_TOP) * SWING_THROW;
     swingV *= SWING_DAMP;
     swing = clamp(swing + swingV, -SWING_MAX, SWING_MAX);
     carriedDX = 0;
+  }
+
+  /**
+   * Seconds until the cat meets the floor, dropping the way `stepGround`
+   * drops it. Exact rather than eyeballed, because it's the entire budget the
+   * righting reflex has to work inside: guess it long and the cat is upright
+   * early and glides down stiff, guess it short and it lands mid-turn.
+   */
+  function timeToFloor(): number {
+    if (!limits) return 0;
+    const scale = limits.scale;
+    const d = (limits.floor - winY) / scale;
+    if (d <= 0) return 0;
+    const v = fallVY / scale;
+    // A long drop stops accelerating partway down, so the fall is in two parts
+    const ramp = Math.max(0, (FALL_MAX - v) / FALL_G);
+    const ramped = v * ramp + 0.5 * FALL_G * ramp * ramp;
+    if (ramped >= d) return (Math.sqrt(v * v + 2 * FALL_G * d) - v) / FALL_G;
+    return ramp + (d - ramped) / FALL_MAX;
+  }
+
+  /**
+   * Hand the spin over to the righting reflex, to arrive feet-down in `dur`.
+   *
+   * From here the angle is on rails: a cubic that leaves at exactly the speed
+   * the cat was already turning at — so nothing jolts — and arrives at a whole
+   * number of turns with nothing left over, at the same moment the floor does.
+   *
+   * Which whole turn it arrives at is the whole question, and it is answered
+   * by how much spin is left rather than by a rule: a cat still going finishes
+   * the turn it's in, and one that has run out takes the short way home.
+   */
+  function beginRight(dur: number) {
+    righting = true;
+    rightAt = 0;
+    // However much air there is, that's the budget. `RIGHT_MIN` is only for a
+    // cat set down still spinning, where there's no fall to time anything by.
+    rightDur = dur > 0 ? Math.max(dur, 1 / 120) : RIGHT_MIN;
+    rightFrom = spin;
+    rightV = spinV;
+    // The short way home, and where a cat with nothing left should go rather
+    // than turning one more lap for the sake of it.
+    let to = Math.round(spin / TAU) * TAU;
+    // Still turning hard, though, and the short way home is backwards — so it
+    // sees out the turn it's in instead of stopping dead in the air and
+    // drifting back into upright. A third of the entry speed is where the
+    // curve stops needing to double back to get there.
+    const dir = spinV >= 0 ? 1 : -1;
+    const need = (Math.abs(spinV) * rightDur) / 3;
+    if (need > RIGHT_LAP) {
+      let on = to;
+      while ((on - spin) * dir < need) on += dir * TAU;
+      // ...unless the floor is too close for that, and seeing it out would
+      // mean whipping the cat round faster than any whirl ever managed. Out of
+      // time, it takes the short way and wears the overshoot.
+      if (Math.abs(on - spin) / rightDur <= RIGHT_RATE) to = on;
+    }
+    rightTo = to;
+  }
+
+  /** The whirl, the tumble and the twist, per animation frame. */
+  function stepSpin(dt: number) {
+    if (righting) {
+      rightAt += dt;
+      const s = Math.min(1, rightAt / rightDur);
+      const s2 = s * s;
+      const s3 = s2 * s;
+      spin =
+        (2 * s3 - 3 * s2 + 1) * rightFrom +
+        (s3 - 2 * s2 + s) * rightDur * rightV +
+        (-2 * s3 + 3 * s2) * rightTo;
+      if (s >= 1) {
+        // `rightTo` is a whole number of turns, so this is where it already is
+        spin = 0;
+        spinV = 0;
+        spinning = false;
+        righting = false;
+        // Set down mid-whirl rather than dropped: it never left the floor, so
+        // there's no landing to be had — just the knees going as it stops.
+        if (!falling && squash === 0) dip = 3;
+      }
+      return;
+    }
+
+    // Winding up. Circling pours in and everything leaks steadily back out, so
+    // reaching the top takes a whirl that is both fast and kept up — one lap,
+    // however sharp, drains away before a second one can build on it.
+    if (dragging) spinV = clamp(spinV + spinIn * SPIN_GAIN, -SPIN_MAX, SPIN_MAX);
+    spinIn = 0;
+    spinV *= Math.exp(-SPIN_DRAG * dt);
+    if (Math.abs(spinV) < SPIN_STOP) spinV = 0;
+
+    // Over the top, and it stays over until it has wound down and levelled off
+    // again. Everything below this shows nothing at all: `spin` never leaves
+    // zero, the renderer takes its ordinary un-turned path, and the cat is the
+    // dangling, swinging one it has always been.
+    if (!spinning && Math.abs(spinV) >= SPIN_TRIP) spinning = true;
+    if (!spinning && spin === 0) return;
+
+    spin += spinV * dt;
+    // Kept inside a single turn either way, so that picking a landing angle
+    // stays arithmetic on small numbers however long the cat has been spinning.
+    if (spin > TAU) spin -= TAU;
+    else if (spin < -TAU) spin += TAU;
+
+    if (dragging) {
+      // Still held, and it has run out of momentum: the cat pulls itself back
+      // level, hands the dangle back to the pendulum, and is a carried cat
+      // again — rather than staying stuck at whatever angle it stopped at.
+      if (Math.abs(spinV) < SPIN_REST) {
+        const to = Math.round(spin / TAU) * TAU;
+        spin += (to - spin) * Math.min(1, SPIN_TRUE * dt);
+        if (Math.abs(spin - to) < 0.01) {
+          spin = 0; // `to` is a whole turn, so this is where it already is
+          spinning = false;
+        }
+      }
+      return;
+    }
+
+    // Out of the hand, and the floor is close enough to start twisting for.
+    // A cat let go at floor level gets `RIGHT_MIN` to sort itself out on the
+    // spot; anything with air under it gets exactly the air it has.
+    const t = timeToFloor();
+    if (t <= RIGHT_DUR) beginRight(t);
   }
 
   /** Window movement, per animation frame. `dt` is in seconds. */
@@ -524,6 +723,11 @@
    * enough that a cat which was talked over — its name caught in somebody
    * else's conversation — settles back down while you're still watching, so
    * the mistake reads as a cat mishearing rather than as a cat stuck.
+   *
+   * Not decoration: the ear really does hold a window open for the rest of the
+   * sentence, and this is how long it is ($FOLLOW_MS in ears/sapi.rs). The two
+   * have to end together, or the cat is either listening with its ears down or
+   * sitting there attentive at something that stopped hearing seconds ago.
    */
   const LISTEN_TICKS = 45;
 
@@ -950,7 +1154,7 @@
     // Off the ground, nothing the mood wanted survives — gravity is doing the
     // posing now, and the whole arc of a pick-up runs through here: dangling,
     // reaching for the floor, folding into it, and springing back up.
-    if (carried() || falling || squash > 0) {
+    if (carried() || falling || squash > 0 || spun()) {
       pose.groomPaw = "none";
       pose.playPaw = "none";
       pose.bob = 0;
@@ -975,9 +1179,18 @@
       pose.posture = "land";
       pose.tail = "up";
       pose.eyes = "closed";
+    } else if (spun()) {
+      // Turning with nothing holding it and nothing to fall to — whirled and
+      // set straight back down. It goes round in the same reaching-for-the-
+      // floor shape it would tumble in, because it is still looking for one.
+      pose.posture = "fall";
+      pose.tail = "up";
+      pose.eyes = "open";
+      pose.gazeY = 1;
     } else if (dip > 0) {
       pose.bob = 1; // down off a pounce — knees, not a whole cat
     }
+    pose.spin = spin;
     pose.lift = Math.round(lift);
     // ...and unfolds a pixel past standing before it settles.
     if (rebound > 0 && !falling && !carried()) pose.lift += 1;
@@ -1048,6 +1261,9 @@
     dragging = false;
     downX = lastX = e.screenX;
     downY = lastY = e.screenY;
+    whirlX = 0;
+    whirlY = 0;
+    spinIn = 0;
     canvas.setPointerCapture(e.pointerId);
   }
 
@@ -1070,11 +1286,35 @@
       // scruffed off the floor: it starts swinging on the way up, and which
       // way is whichever way it happened to be leaning
       swingV = Math.random() < 0.5 ? -1.2 : 1.2;
+      // Caught mid-twist — being picked up interrupts the reflex, and whatever
+      // it was turning at carries straight on into the hand.
+      righting = false;
       canvas.style.cursor = "grabbing";
     }
     // Fed to the pendulum on the next art tick, so a fast haul across the desk
     // throws the body further than a careful one.
     carriedDX += dx;
+
+    // How far the pointer's direction of travel turned on this move — the
+    // signed angle from the last leg of the path to this one. Circling sweeps
+    // it a full turn a lap whatever the circle's size, and a straight haul
+    // turns it not at all, which is exactly the difference between hauling the
+    // cat somewhere and winding it up. Short moves are ignored: below a pixel
+    // or two the direction is mostly the mouse rounding itself off.
+    if (Math.abs(dx) + Math.abs(dy) >= SPIN_STEP) {
+      if (Math.abs(whirlX) + Math.abs(whirlY) >= SPIN_STEP) {
+        const turn = Math.atan2(whirlX * dy - whirlY * dx, whirlX * dx + whirlY * dy);
+        // A reversal is not a turn. Doubling back reads as exactly half a
+        // circle, and — the two halves being indistinguishable — always the
+        // same half, so a straight shake back and forth would otherwise wind
+        // the cat up harder than any real circling ever could. Going round
+        // bends the path by a sliver at a time; anything past a right angle in
+        // one move is a change of mind, and changes of mind aren't laps.
+        if (Math.abs(turn) <= SPIN_ARC) spinIn += turn;
+      }
+      whirlX = dx;
+      whirlY = dy;
+    }
     if (!world || !limits) return;
 
     // The cat can be carried across every monitor, but never below the ground
@@ -1117,7 +1357,9 @@
     if (!dragging) return;
     dragging = false;
     canvas.style.cursor = "";
-    limp = limits && winY < limits.floor - 1 ? LIMP_TICKS : 0;
+    // A cat let go mid-whirl doesn't hang limp for a beat first — it is already
+    // committed, and the tumble it's in is the twist.
+    limp = limits && winY < limits.floor - 1 && !spun() ? LIMP_TICKS : 0;
     if (limp === 0) {
       swing = 0;
       swingV = 0;
@@ -1143,7 +1385,15 @@
       // clamped so a backgrounded window doesn't resume with a huge step
       const dt = last ? Math.min((now - last) / 1000, 0.1) : 0;
       last = now;
-      if (dt > 0) stepGround(dt);
+      if (dt === 0) return;
+      const wasSpun = spun();
+      stepSpin(dt);
+      stepGround(dt);
+      // A turn is the one thing here that can't wait for the art tick. The cat
+      // is still posed at 10fps — same body, same tail, same face — but the
+      // angle it's drawn at moves every frame, because a drop lasts about half
+      // a second and five frames of tumble is not a tumble, it's a slideshow.
+      if (spun() || wasSpun) draw();
     };
     raf = requestAnimationFrame(frame);
 

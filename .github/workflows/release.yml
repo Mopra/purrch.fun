@@ -1,0 +1,82 @@
+# Builds a signed, updatable release from a tag.
+#
+# The output is a *draft*, on purpose. `plugins.updater.endpoints` points at
+# `releases/latest/download/latest.json`, so publishing the release is the
+# moment every installed copy is offered the update — and that should be a
+# decision someone makes after installing the artifact on a real machine, not a
+# side effect of pushing a tag. RELEASING.md has the checklist.
+#
+# What is signed here is the *update*, with the minisign key, which is what
+# lets existing installs trust the download. It is not Authenticode: the
+# installer is still unsigned and still trips SmartScreen. See RELEASING.md.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # The updater compares the running build against the version in the
+      # manifest it downloads. If these two disagree, users are either offered
+      # nothing or offered the same update forever — both silent, both nasty.
+      - name: versions must agree with the tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $pkg = (Get-Content package.json | ConvertFrom-Json).version
+          $conf = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          Write-Host "tag=$tag package.json=$pkg tauri.conf.json=$conf"
+          if ($tag -ne $pkg -or $tag -ne $conf) {
+            throw "version mismatch: tag $tag, package.json $pkg, tauri.conf.json $conf"
+          }
+
+      # A release that fails its own tests is not a release.
+      - name: test
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Without these the bundle builds but ships no `.sig`, and every
+          # existing install rejects the update as unsigned.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Purrch ${{ github.ref_name }}
+          releaseBody: |
+            Install the `.exe` below.
+
+            Windows will warn that the publisher is unknown — Purrch isn't
+            code-signed yet. That warning is accurate, and you should only click
+            past it if you trust this download.
+          releaseDraft: true
+          prerelease: false
+          # `latest.json` is the manifest the updater reads; without this the
+          # release has an installer nobody is told about.
+          includeUpdaterJson: true
+          args: --bundles nsis,updater

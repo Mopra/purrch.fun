@@ -65,17 +65,27 @@ pub enum BridgeEvent {
     /// The model is reasoning but hasn't said anything yet.
     Thinking,
     /// A complete chunk of assistant prose.
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// The agent picked up a tool. `detail` is a human-readable one-liner.
-    ToolStart { tool: String, detail: String },
-    ToolEnd { tool: String, ok: bool },
+    ToolStart {
+        tool: String,
+        detail: String,
+    },
+    ToolEnd {
+        tool: String,
+        ok: bool,
+    },
     /// Terminal event for the turn. Always exactly one of these or `Failed`.
     Finished {
         ok: bool,
         text: Option<String>,
         ms: Option<u64>,
     },
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 /// Per-backend translation layer.

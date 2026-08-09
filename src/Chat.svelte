@@ -1,13 +1,17 @@
 <script lang="ts">
-  import type { Backend } from "./lib/bridge.ts";
+  import type { Backend, Other } from "./lib/bridge.ts";
   import type { Entry } from "./lib/entry.ts";
+
+  import type { Available } from "./lib/colony.ts";
 
   let {
     backends,
+    others = [],
     backendId = $bindable(),
     entries,
     busy,
     agreed,
+    update = null,
     name,
     /** Bound so a file drop can write into the composer from outside. */
     draft = $bindable(""),
@@ -18,13 +22,22 @@
     onhush,
     onsavekey,
     onusesubscription,
+    onupdate,
   }: {
     backends: Backend[];
+    /**
+     * CLIs that are installed but that Purrch can't drive yet. Said out loud
+     * rather than ignored: someone who installs Gemini CLI and is then told
+     * "no agent CLI found" has every reason to think the app is broken.
+     */
+    others?: Other[];
     backendId: string;
     entries: Entry[];
     busy: boolean;
     /** Until the user accepts, the composer stays locked. */
     agreed: boolean;
+    /** A newer Purrch, if one has been found. */
+    update?: Available | null;
     /** Whose panel this is — the cat you're talking to, not the app. */
     name: string;
     draft?: string;
@@ -36,6 +49,7 @@
     onhush: () => void;
     onsavekey: (key: string) => void;
     onusesubscription: () => void;
+    onupdate: () => void;
   } = $props();
 
   let log: HTMLDivElement | undefined = $state();
@@ -103,7 +117,11 @@
     <button class="who" onclick={oncollar} title="name and colour">{name}</button>
     <select bind:value={backendId} disabled={busy} title="which subscription to spend">
       {#each backends as b (b.id)}
-        <option value={b.id}>{b.label}{b.signedIn ? "" : " (not signed in)"}</option>
+        <option value={b.id}>
+          {b.label}{b.signedIn ? "" : " (not signed in)"}{b.experimental
+            ? " (untested)"
+            : ""}
+        </option>
       {/each}
       {#if backends.length === 0}
         <option value="">no agent CLI found</option>
@@ -113,6 +131,32 @@
          harder than the thing sitting right there in the corner. -->
     <button class="x" onclick={onhush} title="hush (esc)">&#x2715;</button>
   </header>
+
+  <!-- A newer Purrch. Never installed on its own — see `installUpdate`. -->
+  {#if update?.version}
+    <div class="notice update">
+      <span>Purrch {update.version} is out.</span>
+      <button class="link" onclick={onupdate}>get it</button>
+    </div>
+  {/if}
+
+  <!-- The adapter for this CLI has never been run against the real thing, so
+       say so here rather than letting a strange-looking turn be a mystery. -->
+  {#if active?.experimental}
+    <p class="notice warn">
+      The {active.label} bridge is untested — it was written from docs, not from
+      a real run. If turns come back oddly, that's the likeliest reason.
+    </p>
+  {/if}
+
+  <!-- The keychain wasn't reachable, so the key is in a file instead. The one
+       failure that is otherwise completely invisible. -->
+  {#if active?.hasKey && active.keyInFile}
+    <p class="notice warn">
+      Your {active.label} key is in a file in Purrch's config folder — Windows
+      Credential Manager wasn't reachable when you saved it.
+    </p>
+  {/if}
 
   {#if active && takesKey}
     <button
@@ -175,7 +219,13 @@
       <p>
         It also listens. Your microphone stays open for its name — "{name}, open
         my mail" — and nothing else is acted on. The audio never leaves this
-        machine; Windows does the hearing. Right-click the cat to stop it.
+        machine. Right-click the cat to stop it.
+      </p>
+      <p>
+        And it works while you don't. Give a cat chores and it goes off on a
+        schedule with nobody watching, spending your subscription each time.
+        There's a daily cap on the board, and every errand it runs is written
+        down with the tools it used.
       </p>
       <button class="agree" onclick={onagree}>I know. let it loose.</button>
     </div>
@@ -184,7 +234,13 @@
   <div class="log" class:hidden={!agreed} bind:this={log}>
     {#if entries.length === 0}
       <p class="empty">
-        {#if backends.length === 0}
+        {#if backends.length === 0 && others.length > 0}
+          <!-- Found, but there's no adapter for it. Naming what was seen beats
+               "no agent CLI found" next to an installed one. -->
+          Purrch can see {others.map((o) => o.label).join(" and ")}, but can't
+          drive {others.length === 1 ? "it" : "them"} yet — only Claude Code and
+          Codex CLI so far. Install one of those and sign in once.
+        {:else if backends.length === 0}
           No agent CLI found. Install Claude Code or Codex, sign in once, and
           Purrch will pick it up — your subscription, your machine.
         {:else}
@@ -323,6 +379,35 @@
     font-size: 12px;
     color: #d9b3cc;
     border-bottom: 1px solid #5a3b52;
+  }
+
+  /* Things the panel has to say about itself rather than about the cat: an
+     update, an untested bridge, a key that didn't make it to the keychain.
+     Quiet, above the log, and never in the transcript — none of it is
+     something the cat said. */
+  .notice {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin: 0;
+    padding: 5px 7px;
+    font-size: 11px;
+    line-height: 1.45;
+    border-bottom: 1px solid #5a3b52;
+  }
+
+  .notice.warn {
+    color: #e8c07d;
+    background: #33221f;
+  }
+
+  .notice.update {
+    color: #b6cfe8;
+    background: #23283a;
+  }
+
+  .notice .link {
+    flex: 0 0 auto;
   }
 
   /* The same line, but it opens the billing drawer. Styled back down from the

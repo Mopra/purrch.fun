@@ -10,6 +10,7 @@
   import { coatById } from "./lib/coats.ts";
   import * as bridge from "./lib/bridge.ts";
   import * as chores from "./lib/chores.ts";
+  import * as colony from "./lib/colony.ts";
   import * as ears from "./lib/ears.ts";
   import { recall, remember, flush, type CatMemory } from "./lib/memory.ts";
 
@@ -106,21 +107,43 @@
   let doing = $state("");
   let unread = $derived(pile.filter((g) => !g.read).length);
   let backends = $state<bridge.Backend[]>([]);
+  /** Agent CLIs that are installed but that Purrch can't drive yet. */
+  let others = $state<bridge.Other[]>([]);
   let backendId = $state("");
   let entries = $state<Entry[]>([]);
   let busy = $state(false);
 
-  /** One-time agreement that the cat runs with no permission checks at all. */
-  const AGREED_KEY = "purrch.unleashed";
-  let agreed = $state(false);
+  /**
+   * What this cat has spent of its day, and what the colony has agreed to.
+   *
+   * Both come from Rust, and the agreement in particular *only* comes from
+   * Rust: it used to live in `localStorage`, where it guarded the composer and
+   * nothing else — the chore board, the clock and the microphone all reached an
+   * agent without going past it. The gate below is now the polite half of a
+   * check that `bridge_send`, `chores_run_now` and the scheduler all make for
+   * themselves.
+   */
+  let colonySettings = $state<colony.Settings>({
+    unleashed: false,
+    dailyHunts: 40,
+  });
+  let spend = $state<colony.Spend>({ today: 0, cap: 40, nextFree: null });
+  let agreed = $derived(colonySettings.unleashed);
+  /** Whether this cat has done as much unasked work as it's allowed to today. */
+  let spentOut = $derived(spend.today >= spend.cap);
+  /** Whether Purrch comes back on its own — what the chore board rests on. */
+  let startsWithWindows = $state(false);
 
-  function agree() {
-    agreed = true;
-    try {
-      localStorage.setItem(AGREED_KEY, "1");
-    } catch {
-      // private mode / storage disabled — it'll just ask again next launch
-    }
+  async function agree() {
+    // The ear is gated on the same agreement in Rust, so the microphone opens
+    // as a consequence of this: `agreed` is derived from these settings, and
+    // the effect that tunes the ear reads it.
+    colonySettings = await colony.unleash();
+  }
+
+  /** Re-reads the day's spending. Cheap, and always after something spent it. */
+  async function refreshSpend() {
+    spend = await colony.spend();
   }
 
   /** Continues the conversation across turns; reset when the cat forgets. */
@@ -219,18 +242,28 @@
     let unlistenEar: (() => void) | undefined;
     let unlistenHunt: (() => void) | undefined;
     let unlistenGift: (() => void) | undefined;
-
-    try {
-      agreed = localStorage.getItem(AGREED_KEY) === "1";
-    } catch {
-      agreed = false;
-    }
+    let unlistenUpdate: (() => void) | undefined;
 
     (async () => {
       label = await bridge.catLabel();
       who = identity.load(label);
       named = true;
-      backends = await bridge.detect();
+
+      // What the colony has agreed to, straight from Rust. A build that agreed
+      // back when this lived in `localStorage` is carried over once, so nobody
+      // is asked twice for the same permission — and the old key is dropped, so
+      // nothing reads it again.
+      colonySettings = await colony.settings();
+      if (!colonySettings.unleashed && agreedInStorage()) {
+        colonySettings = await colony.unleash();
+      }
+      forgetStoredAgreement();
+      spend = await colony.spend();
+      startsWithWindows = await colony.autostart();
+
+      const found = await bridge.detect();
+      backends = found.backends;
+      others = found.others;
       const past = await recall();
       memory = past;
 
@@ -272,6 +305,11 @@
       // Subscribed before the state is read so nothing slips through the gap.
       unlistenHunt = await chores.onHunt(huntEvent);
       unlistenGift = await chores.onGift(gift);
+      // The tray can check for updates with every panel shut, so the answer
+      // arrives as a broadcast rather than as the result of a call.
+      unlistenUpdate = await colony.onUpdate((found) => {
+        if (found.version) update = found;
+      });
       board = await chores.list();
       pile = await chores.gifts();
       const out = await chores.status();
@@ -289,8 +327,56 @@
       unlistenEar?.();
       unlistenHunt?.();
       unlistenGift?.();
+      unlistenUpdate?.();
     };
   });
+
+  // --- the agreement, as it used to be kept ---
+  //
+  // Purrch 0.1 stored it in `localStorage` under this key. It's read exactly
+  // once, to carry an existing user across, and then removed — leaving it
+  // behind would mean two places claiming to know the same thing, and only one
+  // of them being the one that's actually checked.
+
+  const OLD_AGREED_KEY = "purrch.unleashed";
+
+  function agreedInStorage(): boolean {
+    try {
+      return localStorage.getItem(OLD_AGREED_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  function forgetStoredAgreement() {
+    try {
+      localStorage.removeItem(OLD_AGREED_KEY);
+    } catch {
+      // storage disabled — there was nothing to carry over anyway
+    }
+  }
+
+  /** A newer Purrch, if the tray or the panel has found one. */
+  let update = $state<colony.Available | null>(null);
+
+  /**
+   * Takes the update the panel is offering.
+   *
+   * Never automatic. This app runs an agent with every permission check off;
+   * one that also replaced its own binary while nobody was looking would be a
+   * bigger ask than the one the user actually agreed to.
+   */
+  async function installUpdate() {
+    try {
+      // The app restarts into the new version, so nothing after this runs on
+      // success — which is also why the memory is flushed first.
+      await flush();
+      await colony.installUpdate();
+    } catch (err) {
+      entries = [...entries, { role: "error", text: String(err) }];
+      update = null;
+    }
+  }
 
   function handle(e: bridge.BridgeEvent) {
     switch (e.kind) {
@@ -417,6 +503,11 @@
     if (doing) return doing;
     if (live) return `out on ${live.name}`;
     if (unread > 0) return `${unread} gift${unread === 1 ? "" : "s"} by the door`;
+    // Worth surfacing here rather than only on the board: a cat that has quietly
+    // stopped doing its chores looks exactly like a cat with nothing to do, and
+    // "why hasn't it checked my mail" is a question you'd otherwise have to go
+    // digging for.
+    if (board.length > 0 && spentOut) return "done for the day";
     return "";
   });
 
@@ -656,6 +747,9 @@
       case "failed":
         live = null;
         doing = "";
+        // A hunt just spent part of the day's budget, so what the board says
+        // about it is now one out of date.
+        void refreshSpend();
         if (e.kind === "finished" && e.ok) cat?.done();
         else cat?.rest();
         break;
@@ -698,9 +792,31 @@
     board = await chores.list();
   }
 
+  /**
+   * Rust can refuse this — a cat that has spent its day, or a colony that was
+   * never let loose. Somebody is looking at the board when they press it, so
+   * the reason goes on the board rather than into the log.
+   */
+  let boardNote = $state("");
+
   async function runChore(id: string) {
-    await chores.runNow(id);
+    boardNote = "";
+    try {
+      await chores.runNow(id);
+    } catch (err) {
+      boardNote = String(err);
+    }
     board = await chores.list();
+    await refreshSpend();
+  }
+
+  async function setBudget(hunts: number) {
+    colonySettings = await colony.setBudget(hunts);
+    await refreshSpend();
+  }
+
+  async function toggleAutostart() {
+    startsWithWindows = await colony.setAutostart(!startsWithWindows);
   }
 
   async function sweep() {
@@ -739,7 +855,9 @@
   async function repay(change: () => Promise<void>, note: string) {
     try {
       await change();
-      backends = await bridge.detect();
+      const found = await bridge.detect();
+      backends = found.backends;
+      others = found.others;
       entries = [...entries, { role: "cat", text: note }];
     } catch (err) {
       entries = [...entries, { role: "error", text: String(err) }];
@@ -854,63 +972,11 @@
     // Closes this cat, or the whole app if it's the last one standing.
     await bridge.dismissCat();
   }
-
-  let debugInfo = $state("");
-  $effect(() => {
-    if (!panelOpen) return;
-    const id = setInterval(() => {
-      const m = document.querySelector("main") as HTMLElement;
-      const ps = document.querySelector(".panel-slot") as HTMLElement;
-      const cs = document.querySelector(".cat-slot") as HTMLElement;
-      const p = document.querySelector(".panel") as HTMLElement;
-      const hd = document.querySelector("header") as HTMLElement;
-      const sel = document.querySelector("select") as HTMLElement;
-      const log = document.querySelector(".log") as HTMLElement;
-      // min-content width of a clone, measured out of flow
-      const probe = document.createElement("div");
-      probe.style.cssText =
-        "position:absolute;left:-9999px;top:0;width:min-content;visibility:hidden;";
-      document.body.appendChild(probe);
-      const mc = (e: HTMLElement | null) => {
-        if (!e) return "-";
-        probe.replaceChildren(e.cloneNode(true));
-        const w = Math.round(
-          (probe.firstElementChild as HTMLElement).getBoundingClientRect().width,
-        );
-        return String(w);
-      };
-      const parts = [`mc pnl ${mc(p)} hdr ${mc(hd)} log ${mc(log)}`];
-      const kids = [...(hd?.children ?? [])] as HTMLElement[];
-      parts.push(
-        "hdrkids " + kids.map((k) => `${k.tagName}:${mc(k)}`).join(" "),
-      );
-      const logKids = [...(log?.children ?? [])] as HTMLElement[];
-      parts.push(
-        "logmax " + Math.max(0, ...logKids.map((k) => Number(mc(k)))),
-      );
-      const form = document.querySelector("form") as HTMLElement;
-      parts.push(`form ${mc(form)} sub ${mc(document.querySelector(".sub"))}`);
-      probe.remove();
-      const box = (e: HTMLElement | null) =>
-        e ? `${Math.round(e.getBoundingClientRect().left)}+${Math.round(e.getBoundingClientRect().width)}/${e.scrollWidth}` : "-";
-      debugInfo =
-        `vp ${window.innerWidth} main ${box(m)} slot ${box(ps)}\n` +
-        `cat ${box(cs)} pnl ${box(p)}\n` +
-        parts.join("\n");
-    }, 300);
-    return () => clearInterval(id);
-  });
 </script>
-
-{#if panelOpen}
-  <div id="dbg" style="position:fixed;left:0;top:0;z-index:99;background:#000;color:#0f0;font:9px monospace;padding:2px;white-space:pre;pointer-events:none;">
-    {debugInfo}
-  </div>
-{/if}
 
 <svelte:window
   onkeydown={(e) => e.key === "Escape" && closeMenu()}
-  onblur={closeMenu}
+  onblur={() => closeMenu()}
   bind:innerWidth={winW}
   bind:innerHeight={winH}
 />
@@ -944,11 +1010,17 @@
           {board}
           {live}
           {cwd}
+          {spend}
+          {startsWithWindows}
+          note={boardNote}
+          budget={colonySettings.dailyHunts}
           onadd={addChore}
           onsave={saveChore}
           onremove={removeChore}
           ontoggle={toggleChore}
           onrun={runChore}
+          onbudget={setBudget}
+          onautostart={toggleAutostart}
           onclose={() => (view = "chat")}
         />
       {:else if view === "gifts"}
@@ -956,10 +1028,12 @@
       {:else}
         <Chat
           {backends}
+          {others}
           bind:backendId
           {entries}
           {busy}
           {agreed}
+          {update}
           name={who.name}
           bind:draft
           onsend={send}
@@ -969,6 +1043,7 @@
           onhush={() => togglePanel(false)}
           onsavekey={saveKey}
           onusesubscription={useSubscription}
+          onupdate={installUpdate}
         />
       {/if}
     </div>
@@ -1026,14 +1101,21 @@
         &#x1F4AC; {panelOpen ? "hush" : "chat"}
       </button>
       <button role="menuitem" onclick={collar}>&#x1F3F7; collar</button>
-      <button role="menuitem" onclick={openChores}>
-        &#x1F4CB; chores{board.length > 0 ? ` (${board.length})` : ""}
-      </button>
-      <!-- The count is the point: a cat that's been out is worth going to look
-           at, and this is the same news the pile of mice is telling you. -->
-      <button role="menuitem" onclick={openGifts} class:fresh={unread > 0}>
-        &#x1F381; gifts{unread > 0 ? ` (${unread})` : ""}
-      </button>
+      <!-- Chores and gifts only exist for a colony that's been let loose. A
+           chore is an agent turn that runs with nobody watching, so reaching one
+           from here before agreeing was a way around the gate rather than a
+           feature — Rust refuses either way now, but a menu item that leads to a
+           board you can't use is its own kind of broken. -->
+      {#if agreed}
+        <button role="menuitem" onclick={openChores}>
+          &#x1F4CB; chores{board.length > 0 ? ` (${board.length})` : ""}
+        </button>
+        <!-- The count is the point: a cat that's been out is worth going to
+             look at, and this is the same news the pile of mice is telling. -->
+        <button role="menuitem" onclick={openGifts} class:fresh={unread > 0}>
+          &#x1F381; gifts{unread > 0 ? ` (${unread})` : ""}
+        </button>
+      {/if}
       <button role="menuitem" onclick={forget}>&#x1F9F6; forget</button>
       <button role="menuitem" onclick={anotherCat}>&#x1F431; another cat</button>
       <button role="menuitem" onclick={toggleEars}>
@@ -1058,6 +1140,12 @@
     inset: 0;
     /* The cat lives in the bottom-right corner; the panel grows above it. */
     display: grid;
+    /* The one column is pinned to the window rather than left `auto`, whose
+       floor is the widest thing the panel happens to be holding. A single
+       unwrappable line — a long command in the tool feed — would push that
+       floor past the window, and since the cat is justified to the column's
+       right edge, the cat went out the side of the window with it. */
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: 1fr auto;
     justify-items: end;
   }
@@ -1082,6 +1170,9 @@
 
   .panel-slot {
     width: 100%;
+    /* Both axes, for the same reason: what the panel is holding decides how it
+       scrolls, never how big the window has to be. */
+    min-width: 0;
     min-height: 0;
     padding: 4px 4px 0;
     box-sizing: border-box;
@@ -1118,6 +1209,7 @@
     /* Two lines of a long command, then it gives up — the panel has the rest. */
     display: -webkit-box;
     -webkit-line-clamp: 2;
+    line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
     /* The cat underneath is the drag handle, and this is only ever a label. */

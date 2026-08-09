@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "check": "tsc --noEmit && svelte-check --tsconfig ./tsconfig.json --fail-on-warnings",
     "art:preview": "node scripts/preview.ts",
     "art:coats": "node scripts/coats.ts",
     "icons": "node scripts/make-icons.ts"
@@ -18,7 +19,9 @@
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5",
     "@tauri-apps/cli": "^2",
+    "@types/node": "^26.2.0",
     "svelte": "^5",
+    "svelte-check": "^4.7.5",
     "typescript": "^5",
     "vite": "^6"
   }

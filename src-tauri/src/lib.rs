@@ -1,12 +1,17 @@
 mod bridge;
 mod chores;
+mod colony;
+mod diag;
 mod ears;
 mod hunt;
 mod memory;
+mod tray;
+mod updates;
 
 use bridge::creds::Creds;
 use bridge::{detect, session, TurnRequest};
 use chores::{Board, Chore, Draft, Gift};
+use colony::Colony;
 use ears::Ears;
 use hunt::Hunts;
 use memory::{CatMemory, Memory};
@@ -304,6 +309,16 @@ fn stand(window: &tauri::Window, at: Option<(f64, f64)>) {
     let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
 }
 
+/// Puts a cat back on solid ground wherever it currently is.
+///
+/// `stand` with no remembered spot would send it back to the corner; this
+/// re-runs the same clamping against where it actually is, which is what
+/// rescues a cat left hanging over a monitor that has since been unplugged.
+pub(crate) fn restand(window: &tauri::Window) {
+    let Ok(p) = read_perch(window) else { return };
+    stand(window, Some((p.x, p.y)));
+}
+
 /// Where the cat may stand, and where it is standing now.
 #[tauri::command]
 fn perch(window: tauri::Window) -> Result<Perch, String> {
@@ -338,11 +353,13 @@ fn hop(window: tauri::Window, x: f64, y: f64) -> Result<(), String> {
 }
 
 /// Agent CLIs the user has installed, so the UI can offer them as brains —
-/// each one annotated with how the user has chosen to pay for it.
+/// each one annotated with how the user has chosen to pay for it. Anything
+/// found but not driveable comes back in `others`, so the panel can say why an
+/// installed CLI isn't on the menu instead of claiming it isn't there.
 #[tauri::command]
-fn bridge_detect(creds: State<'_, Arc<Creds>>) -> Vec<detect::Backend> {
-    let mut backends = detect::detect_all();
-    for backend in &mut backends {
+fn bridge_detect(creds: State<'_, Arc<Creds>>) -> detect::Detected {
+    let mut found = detect::detect_all();
+    for backend in &mut found.backends {
         // Only backends that can take a key get asked about one; the rest stay
         // on the default, which is "whatever the CLI already does".
         if backend.key_env.is_none() {
@@ -351,8 +368,9 @@ fn bridge_detect(creds: State<'_, Arc<Creds>>) -> Vec<detect::Backend> {
         let status = creds.status(&backend.id);
         backend.auth = status.auth;
         backend.has_key = status.has_key;
+        backend.key_in_file = status.in_file;
     }
-    backends
+    found
 }
 
 /// Saves an API key for a backend and switches it onto that key.
@@ -387,14 +405,22 @@ fn home_dir() -> String {
 
 /// Runs one turn for the calling cat. Resolves when the turn ends; progress
 /// arrives as events addressed to that cat's window only.
+///
+/// Refuses outright until the colony has been let loose. The panel locks its
+/// own composer too, but this is the check that counts: the composer is one of
+/// several ways to reach an agent, and the others don't pass through it.
 #[tauri::command]
 async fn bridge_send(
     app: tauri::AppHandle,
     window: tauri::Window,
     state: State<'_, Arc<session::BridgeState>>,
     creds: State<'_, Arc<Creds>>,
+    colony: State<'_, Arc<Colony>>,
     request: TurnRequest,
 ) -> Result<(), String> {
+    if !colony.unleashed() {
+        return Err("this colony hasn't been let loose yet".into());
+    }
     let cat = window.label().to_string();
     session::run(
         app,
@@ -421,6 +447,11 @@ fn bridge_cancel(window: tauri::Window, state: State<'_, Arc<session::BridgeStat
 // here that lets one cat read or rewrite another's board. That's not a
 // permission check (nothing in Purrch is); it's what makes a colony a colony
 // rather than one shared to-do list shown in several windows.
+//
+// Every command that takes a chore id scopes it to `window.label()` on the way
+// in — see `Board::mine`. The ids never leave the window that owns them today,
+// so this costs nothing; it's here so the invariant above is enforced by the
+// code rather than by the frontend happening to be well behaved.
 
 /// Everything on this cat's board.
 #[tauri::command]
@@ -436,31 +467,52 @@ fn chores_add(window: tauri::Window, board: State<'_, Arc<Board>>, draft: Draft)
 
 #[tauri::command]
 fn chores_update(
+    window: tauri::Window,
     board: State<'_, Arc<Board>>,
     id: String,
     patch: serde_json::Value,
 ) -> Result<Chore, String> {
-    board.update(&id, &patch)
+    board.update(window.label(), &id, &patch)
 }
 
 #[tauri::command]
-fn chores_remove(board: State<'_, Arc<Board>>, id: String) {
-    board.remove(&id);
+fn chores_remove(window: tauri::Window, board: State<'_, Arc<Board>>, id: String) {
+    board.remove(window.label(), &id);
 }
 
 /// Sends the cat after one now instead of waiting for its slot. It still
 /// queues behind whatever the cat is already doing, including you.
+///
+/// Unlike a chore coming due on the clock, somebody is watching this one — so
+/// the two ways it can decline to go anywhere are said out loud rather than
+/// leaving a button that does nothing.
 #[tauri::command]
 fn chores_run_now(
     app: tauri::AppHandle,
     window: tauri::Window,
     board: State<'_, Arc<Board>>,
     hunts: State<'_, Arc<Hunts>>,
+    colony: State<'_, Arc<Colony>>,
     id: String,
-) {
-    board.nudge(&id);
-    hunts.queue(window.label(), &id);
-    hunt::pump(&app, window.label());
+) -> Result<(), String> {
+    if !colony.unleashed() {
+        return Err("this colony hasn't been let loose yet".into());
+    }
+    // Its own chore or nothing: a window may not send a sibling out, and the
+    // hunt is queued against the cat that *owns* the chore rather than the one
+    // that asked — those are the same cat here, and this is what keeps them so.
+    let Some(chore) = board.mine(window.label(), &id) else {
+        return Err("no such chore".into());
+    };
+    // Asking by hand doesn't buy extra budget: a "run now" that ignored the cap
+    // would make the cap a suggestion, and the bill doesn't care who pressed it.
+    if colony.spend(&chore.cat).spent_out() {
+        return Err("this cat has done its day — it'll go again when a slot frees up".into());
+    }
+    board.nudge(&chore.cat, &chore.id);
+    hunts.queue(&chore.cat, &chore.id);
+    hunt::pump(&app, &chore.cat);
+    Ok(())
 }
 
 /// What this cat is out doing right now, for the check-in line. Comes from
@@ -487,11 +539,42 @@ fn gifts_clear(window: tauri::Window, board: State<'_, Arc<Board>>) {
     board.clear(window.label());
 }
 
+// --- the colony as a whole ---
+
+/// What the user has agreed to, and what they've capped the cats at.
+#[tauri::command]
+fn colony_settings(colony: State<'_, Arc<Colony>>) -> colony::Settings {
+    colony.settings()
+}
+
+/// The user has read the gate and let the cats loose. There is no way back
+/// through this door — see [`Colony::unleash`].
+#[tauri::command]
+fn colony_unleash(colony: State<'_, Arc<Colony>>) -> colony::Settings {
+    colony.unleash();
+    colony.settings()
+}
+
+/// Changes how much a cat may do on its own in a day.
+#[tauri::command]
+fn colony_set_budget(colony: State<'_, Arc<Colony>>, hunts: u32) -> colony::Settings {
+    colony.set_daily_hunts(hunts)
+}
+
+/// What this cat has spent of that budget in the last 24 hours.
+#[tauri::command]
+fn colony_spend(window: tauri::Window, colony: State<'_, Arc<Colony>>) -> colony::Spend {
+    colony.spend(window.label())
+}
+
 /// This cat says what it's called and whether it wants to be listened for.
 ///
 /// The frontend drives this rather than Rust reading the memory store, because
-/// a cat's ears are only open once the user has agreed to let the colony act
-/// unasked — and that agreement lives with the rest of the frontend's state.
+/// what a cat is called lives with the rest of the frontend's state. Whether
+/// the microphone may open at all is *not* the frontend's call, though — voice
+/// is a way into this app that doesn't pass through the composer, so the
+/// agreement is checked here as well as there.
+///
 /// Sent on every change; the ear reopens the microphone only when the colony
 /// genuinely sounds different.
 #[tauri::command]
@@ -499,10 +582,51 @@ fn ears_tune(
     app: tauri::AppHandle,
     window: tauri::Window,
     ears: State<'_, Arc<Ears>>,
+    colony: State<'_, Arc<Colony>>,
     name: String,
     listening: bool,
 ) {
-    ears.tune(&app, window.label(), name, listening);
+    ears.tune(&app, window.label(), name, listening && colony.unleashed());
+}
+
+// --- staying current ---
+
+/// Looks for a newer Purrch. Never installs anything by itself.
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle) -> updates::Available {
+    updates::look(&app).await
+}
+
+/// Installs what [`update_check`] found and restarts into it.
+#[tauri::command]
+async fn update_install(app: tauri::AppHandle) -> Result<(), String> {
+    updates::install(&app).await
+}
+
+/// Whether Purrch comes back on its own at login.
+///
+/// The chore board is only honest with this on: "your PC is already on, so
+/// something may as well be using it" assumes something is running. It's the
+/// user's call, so it's a switch rather than a default — but the panel makes
+/// the case for it when there are chores on the board and it's off.
+#[tauri::command]
+fn autostart_enabled(app: tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn autostart_set(app: tauri::AppHandle, on: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let changed = if on {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    changed.map_err(|e| e.to_string())?;
+    log::info!("start with Windows: {on}");
+    Ok(manager.is_enabled().unwrap_or(on))
 }
 
 /// Splits dropped paths into folders and files, so the frontend can decide
@@ -551,8 +675,14 @@ fn build_cat(app: &tauri::AppHandle, label: &str) -> Result<tauri::WebviewWindow
 
 /// Adds another cat to the colony. Each one is a separate window with its own
 /// label, which is what keeps its agent session — and its memory — independent.
-#[tauri::command]
-async fn spawn_cat(app: tauri::AppHandle, from: tauri::Window) -> Result<String, String> {
+///
+/// `from` is the cat it was asked for from, if there was one. The tray has no
+/// cat behind it, so a colony summoned from there simply lands each newcomer
+/// wherever `stand` would put a cat with nothing to remember.
+pub(crate) fn spawn_beside(
+    app: &tauri::AppHandle,
+    from: Option<&tauri::Window>,
+) -> Result<String, String> {
     // Labels must be unique and stable for the window's lifetime; a counter
     // would collide after a dismiss, so derive from the highest existing. A
     // label that comes free again keeps its cat — see `Memory::leave`.
@@ -561,23 +691,33 @@ async fn spawn_cat(app: tauri::AppHandle, from: tauri::Window) -> Result<String,
         .find(|candidate| app.get_webview_window(candidate).is_none())
         .ok_or("couldn't allocate a cat label")?;
 
-    let built = build_cat(&app, &label)?;
+    let built = build_cat(app, &label)?;
+    let window = built.as_ref().window();
 
     // Drop the newcomer beside its parent rather than on top of it, on the
     // same monitor — its own size there, since the parent may have its chat
     // panel open, and a physical pixel is worth less on a high-DPI screen.
-    if let Ok(p) = read_perch(&from) {
-        let s = p.here();
-        let (w, h) = (CAT_SIZE.0 * s.scale, CAT_SIZE.1 * s.scale);
-        let (min_x, max_x) = p.span(&s, w);
-        let x = (p.x - w - 12.0 * s.scale).clamp(min_x, max_x);
-        let _ = built.set_position(PhysicalPosition::new(
-            x.round() as i32,
-            (s.bottom - h).round() as i32,
-        ));
+    match from.and_then(|from| read_perch(from).ok()) {
+        Some(p) => {
+            let s = p.here();
+            let (w, h) = (CAT_SIZE.0 * s.scale, CAT_SIZE.1 * s.scale);
+            let (min_x, max_x) = p.span(&s, w);
+            let x = (p.x - w - 12.0 * s.scale).clamp(min_x, max_x);
+            let _ = built.set_position(PhysicalPosition::new(
+                x.round() as i32,
+                (s.bottom - h).round() as i32,
+            ));
+        }
+        None => stand(&window, None),
     }
     let _ = built.show();
+    log::info!("a new cat: {label}");
     Ok(label)
+}
+
+#[tauri::command]
+async fn spawn_cat(app: tauri::AppHandle, from: tauri::Window) -> Result<String, String> {
+    spawn_beside(&app, Some(&from))
 }
 
 /// Sends a cat home: it stops coming back at launch. The last one standing
@@ -589,6 +729,7 @@ fn dismiss_cat(
     window: tauri::Window,
     state: State<'_, Arc<session::BridgeState>>,
     memory: State<'_, Arc<Memory>>,
+    colony: State<'_, Arc<Colony>>,
 ) -> Result<(), String> {
     state.cancel_and_forget(window.label());
     if app.webview_windows().len() <= 1 {
@@ -596,6 +737,9 @@ fn dismiss_cat(
         return Ok(());
     }
     memory.leave(window.label());
+    // Its budget goes with it. Deliberately here and not on window close:
+    // quitting Purrch must not be a way to wipe the afternoon's spending.
+    colony.forget(window.label());
     window.close().map_err(|e| e.to_string())
 }
 
@@ -613,10 +757,7 @@ fn resize_around_cat(window: &tauri::Window, target: (f64, f64)) -> Result<(), S
     let p = read_perch(window)?;
     let s = p.here();
 
-    let new = PhysicalSize::new(
-        (target.0 * s.scale) as u32,
-        (target.1 * s.scale) as u32,
-    );
+    let new = PhysicalSize::new((target.0 * s.scale) as u32, (target.1 * s.scale) as u32);
     window.set_size(new).map_err(|e| e.to_string())?;
 
     // The cat is drawn at the bottom-right of the window, so the panel has to
@@ -676,7 +817,20 @@ fn set_menu(window: tauri::Window, w: f64, h: f64) -> Result<(), String> {
 }
 
 pub fn run() {
+    // Before anything else, so that a panic during setup — the likeliest one,
+    // and the one with nothing else to catch it — still lands somewhere.
+    diag::catch_panics();
+
     tauri::Builder::default()
+        .plugin(diag::logger())
+        // `--quiet` is passed to the copy Windows starts at login. Nothing
+        // reads it yet; it's here so that a login launch stays distinguishable
+        // from a launch by hand the first time that difference matters.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--quiet"]),
+        ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Arc::new(session::BridgeState::default()))
         .manage(Arc::new(Hunts::default()))
         .invoke_handler(tauri::generate_handler![
@@ -684,6 +838,10 @@ pub fn run() {
             bridge_send,
             bridge_cancel,
             ears_tune,
+            colony_settings,
+            colony_unleash,
+            colony_set_budget,
+            colony_spend,
             chores_list,
             chores_add,
             chores_update,
@@ -699,6 +857,10 @@ pub fn run() {
             classify_paths,
             spawn_cat,
             dismiss_cat,
+            update_check,
+            update_install,
+            autostart_enabled,
+            autostart_set,
             set_panel,
             set_menu,
             perch,
@@ -741,6 +903,11 @@ pub fn run() {
             // either of them.
             app.manage(Arc::new(Creds::load(&dir)));
 
+            // What the user has agreed to, and how much the cats may spend on
+            // their own. Before the board and the clock, both of which refuse
+            // to do anything without it.
+            app.manage(Arc::new(Colony::load(&dir)));
+
             // The colony's hearing. Its transcriber and language model are a
             // ~150 MB download fetched on first use, so they go in local app
             // data rather than beside the config — nobody wants that following
@@ -782,11 +949,22 @@ pub fn run() {
                     }
                     // One cat that won't come back must not take the rest of
                     // the colony — or the app — down with it.
-                    Err(e) => eprintln!("couldn't bring {label} back: {e}"),
+                    Err(e) => log::error!("couldn't bring {label} back: {e}"),
                 }
             }
 
+            // The colony's front door. After the cats, so a left click on it
+            // has something to gather; before the clock, because a hunt that
+            // fires immediately should have somewhere to be reported from.
+            if let Err(e) = tray::build(&handle) {
+                // A colony with no tray is still a colony — every cat is on the
+                // desktop and works exactly as before. Losing the app over a
+                // missing icon would be the worse trade.
+                log::error!("no tray icon: {e}");
+            }
+
             hunt::start(handle);
+            diag::hello();
             Ok(())
         })
         .run(tauri::generate_context!())

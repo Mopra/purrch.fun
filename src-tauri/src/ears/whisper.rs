@@ -42,7 +42,8 @@ const ENGINE_SHA: &str = "49dcc16de826f20bd53d44f947a1ae49dfa81f86cad67a64d80820
 /// Face publishes; the checksum is what actually pins it. If the file behind
 /// the URL ever changes, the fetch fails and the cats stay on SAPI rather than
 /// quietly running something nobody checked.
-const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+const MODEL_URL: &str =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
 const MODEL_SHA: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
 const MODEL_FILE: &str = "ggml-base.en.bin";
 
@@ -56,9 +57,13 @@ const DOWNLOAD_MB: u64 = 150;
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Fetched {
     /// Started on one of the two pieces. `what` is something sayable.
-    Fetching { what: String },
+    Fetching {
+        what: String,
+    },
     Ready,
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 /// Whether everything needed to transcribe is already on disk.
@@ -243,7 +248,9 @@ mod tests {
     fn both_downloads_are_pinned_to_a_real_sha256() {
         for sha in [ENGINE_SHA, MODEL_SHA] {
             assert_eq!(sha.len(), 64, "{sha} is not a sha256");
-            assert!(sha.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+            assert!(sha
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
         }
         assert_ne!(ENGINE_SHA, MODEL_SHA);
         // A moving target would defeat the pin on the engine, which is the
@@ -322,8 +329,14 @@ mod tests {
         // And the libraries have to have been flattened next to the program,
         // or Windows won't find them when it runs.
         assert!(dir.join("whisper.dll").is_file());
-        assert!(!dir.join("unpack").exists(), "the scratch dir was left behind");
-        assert!(!dir.join("engine.zip").exists(), "the archive was left behind");
+        assert!(
+            !dir.join("unpack").exists(),
+            "the scratch dir was left behind"
+        );
+        assert!(
+            !dir.join("engine.zip").exists(),
+            "the archive was left behind"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

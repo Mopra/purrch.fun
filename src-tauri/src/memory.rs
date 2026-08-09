@@ -199,7 +199,9 @@ impl Memory {
     /// comes back to a slot should come back to its own life, not a blank one.
     pub fn leave(&self, label: &str) {
         let mut cats = self.cats.lock().unwrap();
-        let Some(cat) = cats.get_mut(label) else { return };
+        let Some(cat) = cats.get_mut(label) else {
+            return;
+        };
         cat.present = false;
         cat.last_seen = now_ms();
         write(&self.path, &cats);
@@ -250,7 +252,8 @@ mod tests {
     fn the_transcript_is_capped_and_keeps_the_newest() {
         let mem = Memory::load(&scratch());
         let entries: Vec<Value> = (0..MAX_ENTRIES + 20).map(|i| json!({ "n": i })).collect();
-        mem.remember("main", &json!({ "entries": entries })).unwrap();
+        mem.remember("main", &json!({ "entries": entries }))
+            .unwrap();
 
         let kept = mem.recall("main").entries;
         assert_eq!(kept.len(), MAX_ENTRIES);
@@ -304,7 +307,10 @@ mod tests {
         mem.leave("cat-1");
 
         assert!(mem.peek("cat-1").is_some());
-        assert!(mem.present().is_empty(), "a peek put the cat back on the desktop");
+        assert!(
+            mem.present().is_empty(),
+            "a peek put the cat back on the desktop"
+        );
         // ...and a cat that never existed isn't invented by asking about it.
         assert!(mem.peek("cat-9").is_none());
         assert!(Memory::load(&dir).peek("cat-9").is_none());

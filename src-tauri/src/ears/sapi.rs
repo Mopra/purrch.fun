@@ -42,7 +42,19 @@ pub enum Word {
         /// nothing but SAPI's own guess at the words, and deletes nothing.
         #[serde(default)]
         audio: Option<String>,
+        /// A cat was called by name and nothing else, so the ear has opened a
+        /// short window for the rest of the sentence to arrive on its own.
+        /// There is no command in `text` yet and no audio worth reading.
+        #[serde(default)]
+        waiting: bool,
+        /// This *is* that rest: a command with no name in front of it, which
+        /// belongs to whichever cat opened the window.
+        #[serde(default)]
+        follow: bool,
     },
+    /// A window opened by `waiting` closed again with nothing said into it.
+    /// The cat was greeted rather than asked for something.
+    Unanswered,
     /// Speech that didn't match — somebody talking near an open mic.
     Missed,
 }
@@ -131,18 +143,57 @@ try {
   $rec = New-Object System.Speech.Recognition.SpeechRecognitionEngine $info
 } catch { Fail $_.Exception.Message }
 
-# One sentence shape only: a cat's name, then whatever you want it to do.
+# One sentence shape: a cat's name, then — optionally — whatever you want it
+# to do. The dictation has to be appended with a minimum repeat of zero rather
+# than through the bare AppendDictation(), which requires at least one word:
+# with that, "Hey Tofu" on its own can't match, and rather than rejecting it
+# the engine fills the slot with a confident filler word. Being called and
+# saying nothing came back as "hey tofu a", and the cat was handed "a" as its
+# command.
+$phrases = __PHRASES__
 $choices = New-Object System.Speech.Recognition.Choices
-foreach ($p in __PHRASES__) { $choices.Add([string]$p) }
+foreach ($p in $phrases) { $choices.Add([string]$p) }
 $gb = New-Object System.Speech.Recognition.GrammarBuilder
 $gb.Culture = $info.Culture
 $gb.Append($choices)
-$gb.AppendDictation()
+$dictation = New-Object System.Speech.Recognition.GrammarBuilder
+$dictation.Culture = $info.Culture
+$dictation.AppendDictation()
+$gb.Append($dictation, 0, 1)
 try {
   $grammar = New-Object System.Speech.Recognition.Grammar $gb
   $grammar.Name = 'purrch'
   $rec.LoadGrammar($grammar)
 } catch { Fail "couldn't teach the cats their names: $($_.Exception.Message)" }
+
+# The other half of being called: people say "Hey Tofu", wait to be sure it
+# heard them, and only then say what they want. That second half arrives as its
+# own utterance with no name on the front of it, so the grammar above can't
+# match it and the engine throws it away — the cat sits up, is spoken to, and
+# does nothing.
+#
+# So there is a second grammar that takes a bare sentence, and it stays
+# switched off. It is only ever enabled for a few seconds after a cat has been
+# called with nothing after it, and switched off again the moment something is
+# said or the window runs out. A colony that left this on would hear every
+# conversation in the room, which is the one thing the grammar exists to
+# prevent.
+$fb = New-Object System.Speech.Recognition.GrammarBuilder
+$fb.Culture = $info.Culture
+$fb.AppendDictation()
+try {
+  $follow = New-Object System.Speech.Recognition.Grammar $fb
+  $follow.Name = 'purrch-follow'
+  $rec.LoadGrammar($follow)
+  $follow.Enabled = $false
+} catch { Fail "couldn't teach the cats to wait: $($_.Exception.Message)" }
+
+# How long that window stays open. Matched to the ears the cat visibly puts up
+# when it is called (LISTEN_TICKS in Cat.svelte): the animation and the window
+# have to end together, or the cat is either listening with its ears down or
+# sitting there attentive at something that has already stopped hearing.
+$FOLLOW_MS = 4500
+$followUntil = [datetime]::MinValue
 
 try { $rec.SetInputToDefaultAudioDevice() } catch { Fail 'no microphone Purrch is allowed to listen through' }
 
@@ -196,19 +247,66 @@ $parent = 0
 if ($env:PURRCH_PARENT) { $parent = [int]$env:PURRCH_PARENT }
 
 try {
+  $quiet = 0
   while ($true) {
-    $evt = Wait-Event -Timeout 2
-    if (-not $evt) {
-      if ($parent -gt 0 -and -not (Get-Process -Id $parent -ErrorAction SilentlyContinue)) { break }
-      continue
+    # A second rather than the two it used to be, because the follow-up window
+    # is timed out down there and it has to close near when the cat's ears come
+    # back down, not up to two seconds later.
+    $evt = Wait-Event -Timeout 1
+
+    if ($evt) {
+      $quiet = 0
+      $res = $evt.SourceEventArgs.Result
+      switch ($evt.SourceIdentifier) {
+        'heard' {
+          if ($res) {
+            $text = [string]$res.Text
+            $isFollow = ($res.Grammar -and $res.Grammar.Name -eq 'purrch-follow')
+            # Called by name and nothing else. The engine hands back exactly
+            # one of the wake phrases verbatim, so this is the whole test.
+            $waiting = (-not $isFollow) -and ($phrases -contains $text.ToLower())
+
+            if ($waiting) {
+              $follow.Enabled = $true
+              $followUntil = [datetime]::UtcNow.AddMilliseconds($FOLLOW_MS)
+            } elseif ($follow.Enabled) {
+              # Either the window was just used or the cat has been called
+              # again properly. Nothing more is owed to it.
+              $follow.Enabled = $false
+            }
+
+            # Nothing to transcribe in a name the grammar already spelled, and
+            # a recording of the user's voice that nobody is going to read is
+            # one that should never have been written.
+            $wav = $null
+            if (-not $waiting) { $wav = Save-Utterance $res }
+
+            Say @{ kind = 'heard'; text = $text; confidence = [double]$res.Confidence; audio = $wav; waiting = $waiting; follow = $isFollow }
+          }
+        }
+        'partial' { if ($res) { Say @{ kind = 'partial'; text = [string]$res.Text } } }
+        'missed'  { Say @{ kind = 'missed' } }
+      }
+      Remove-Event -EventIdentifier $evt.EventIdentifier
+    } else {
+      $quiet++
+      if ($quiet -ge 2) {
+        $quiet = 0
+        if ($parent -gt 0 -and -not (Get-Process -Id $parent -ErrorAction SilentlyContinue)) { break }
+      }
     }
-    $res = $evt.SourceEventArgs.Result
-    switch ($evt.SourceIdentifier) {
-      'heard'   { if ($res) { Say @{ kind = 'heard';   text = [string]$res.Text; confidence = [double]$res.Confidence; audio = (Save-Utterance $res) } } }
-      'partial' { if ($res) { Say @{ kind = 'partial'; text = [string]$res.Text } } }
-      'missed'  { Say @{ kind = 'missed' } }
+
+    # Deliberately after whatever just arrived, and not in the quiet branch:
+    # a command that landed inside the window must not be thrown away by the
+    # window closing in the same breath, and a window left open because the
+    # room is noisy enough to keep the event queue busy is the mic staying on
+    # the room. Closing runs late by up to the wait above, which errs the safe
+    # way — a sentence started as the ears drop is still caught, and the ears
+    # are never up on an ear that has stopped listening.
+    if ($follow.Enabled -and [datetime]::UtcNow -gt $followUntil) {
+      $follow.Enabled = $false
+      Say @{ kind = 'unanswered' }
     }
-    Remove-Event -EventIdentifier $evt.EventIdentifier
   }
 } catch { Fail $_.Exception.Message }
 
@@ -276,6 +374,35 @@ mod tests {
     #[test]
     fn two_cats_with_one_name_are_listened_for_once() {
         assert_eq!(phrases(&[cat("Tofu"), cat("tofu")]).len(), LEADS.len());
+    }
+
+    /// The bug this module existed with for a while: `AppendDictation()` on
+    /// its own needs at least one word, so "Hey Tofu" with nothing after it
+    /// couldn't match — and rather than rejecting it the engine invented a
+    /// word to fill the slot. Appending the dictation with a minimum repeat of
+    /// zero is the whole fix, and a revert to the one-liner is silent at
+    /// runtime, so it's pinned here.
+    #[test]
+    fn the_command_half_of_the_grammar_is_optional() {
+        assert!(SCRIPT.contains("$gb.Append($dictation, 0, 1)"));
+        assert!(
+            !SCRIPT.contains("$gb.AppendDictation()"),
+            "a bare AppendDictation on the wake grammar makes a name alone unmatchable"
+        );
+    }
+
+    /// The ear is only ever allowed to hear a sentence with no name in it
+    /// during the few seconds after a cat was called, so the grammar that can
+    /// match one has to arrive switched off.
+    #[test]
+    fn the_follow_up_grammar_starts_switched_off() {
+        assert!(SCRIPT.contains("$follow.Enabled = $false"));
+        let load = SCRIPT.find("$rec.LoadGrammar($follow)").expect("never loaded");
+        let off = SCRIPT.find("$follow.Enabled = $false").unwrap();
+        assert!(off > load, "it has to be switched off once it exists");
+        // ...and there has to be something that closes it again, or the first
+        // time a cat is called the microphone stays open on the room.
+        assert!(SCRIPT.contains("[datetime]::UtcNow -gt $followUntil"));
     }
 
     #[test]
@@ -379,5 +506,106 @@ mod tests {
         assert!(parse("").is_none());
         assert!(parse("not json at all").is_none());
         assert!(parse(r#"{"kind":"purring"}"#).is_none());
+    }
+
+    #[test]
+    fn a_name_on_its_own_is_a_cat_still_being_spoken_to() {
+        assert!(matches!(
+            parse(r#"{"kind":"heard","text":"hey tofu","confidence":0.9,"audio":null,"waiting":true,"follow":false}"#),
+            Some(Word::Heard { waiting: true, follow: false, audio: None, .. })
+        ));
+        // The rest of it, arriving on its own a moment later.
+        assert!(matches!(
+            parse(r#"{"kind":"heard","text":"open notepad","confidence":0.8,"follow":true}"#),
+            Some(Word::Heard { follow: true, waiting: false, .. })
+        ));
+        assert!(matches!(parse(r#"{"kind":"unanswered"}"#), Some(Word::Unanswered)));
+        // An ordinary one-breath command is neither.
+        assert!(matches!(
+            parse(r#"{"kind":"heard","text":"hey tofu open notepad","confidence":0.9}"#),
+            Some(Word::Heard { waiting: false, follow: false, .. })
+        ));
+    }
+
+    /// What the probes above can't tell you and a unit test can't either:
+    /// whether the real speech engine, given the real grammar, does what the
+    /// rest of this assumes. Feeds it synthesised speech rather than a
+    /// microphone, so it needs a Windows with a recogniser but no hardware and
+    /// nobody in the room.
+    ///
+    /// Covers the two halves of the bug at once: a name alone must come back
+    /// as just the name, and the sentence that follows it must be matchable
+    /// only while the window is open.
+    #[tokio::test]
+    #[ignore = "drives the Windows speech engine, takes ~20s"]
+    async fn a_name_alone_stays_a_name_and_the_rest_is_only_heard_when_invited() {
+        let probe = r#"
+Add-Type -AssemblyName System.Speech
+$dir = Join-Path $env:TEMP ('purrch-grammar-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+function Speak($t, $f) {
+  $tts = New-Object System.Speech.Synthesis.SpeechSynthesizer
+  $tts.SetOutputToWaveFile($f); $tts.Rate = -1; $tts.Speak($t); $tts.Dispose()
+}
+$wake = Join-Path $dir 'wake.wav'; Speak 'Hey Tofu' $wake
+$cmd  = Join-Path $dir 'cmd.wav';  Speak 'open notepad' $cmd
+
+$info = @([System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()) |
+  Where-Object { $_.Culture.TwoLetterISOLanguageName -eq 'en' } | Select-Object -First 1
+$rec = New-Object System.Speech.Recognition.SpeechRecognitionEngine $info
+
+$phrases = @('hey tofu','tofu')
+$choices = New-Object System.Speech.Recognition.Choices
+foreach ($p in $phrases) { $choices.Add([string]$p) }
+$gb = New-Object System.Speech.Recognition.GrammarBuilder
+$gb.Culture = $info.Culture
+$gb.Append($choices)
+$dictation = New-Object System.Speech.Recognition.GrammarBuilder
+$dictation.Culture = $info.Culture
+$dictation.AppendDictation()
+$gb.Append($dictation, 0, 1)
+$g = New-Object System.Speech.Recognition.Grammar $gb
+$g.Name = 'purrch'
+$rec.LoadGrammar($g)
+
+$fb = New-Object System.Speech.Recognition.GrammarBuilder
+$fb.Culture = $info.Culture
+$fb.AppendDictation()
+$follow = New-Object System.Speech.Recognition.Grammar $fb
+$follow.Name = 'purrch-follow'
+$rec.LoadGrammar($follow)
+$follow.Enabled = $false
+
+function Feed($wav) {
+  $rec.SetInputToWaveFile($wav)
+  $r = $rec.Recognize()
+  if ($r) { Write-Output ($r.Grammar.Name + '|' + $r.Text) } else { Write-Output 'none|' }
+}
+Feed $wake
+Feed $cmd
+$follow.Enabled = $true
+Feed $cmd
+$follow.Enabled = $false
+Feed $cmd
+$rec.Dispose()
+Remove-Item -Recurse -Force $dir
+"#;
+
+        let out = shell::command(probe)
+            .output()
+            .await
+            .expect("couldn't run the speech engine");
+        let said = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = said.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 4, "unexpected output: {said:?}");
+
+        // A name alone comes back as the name, with nothing invented after it.
+        assert_eq!(lines[0], "purrch|hey tofu");
+        // ...and the sentence that follows it is inaudible until it's invited,
+        // which is the whole reason the cats can't hear the room.
+        assert_eq!(lines[1], "none|");
+        assert!(lines[2].starts_with("purrch-follow|"), "got {:?}", lines[2]);
+        assert!(!lines[2].ends_with('|'), "heard nothing: {:?}", lines[2]);
+        assert_eq!(lines[3], "none|");
     }
 }

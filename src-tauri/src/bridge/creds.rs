@@ -61,6 +61,13 @@ pub struct Status {
     /// A key for this backend is actually in the store — the mode alone can
     /// lie, if the keychain was cleared out from under us.
     pub has_key: bool,
+    /// The key is in the fallback file rather than the OS credential store.
+    ///
+    /// Worth saying out loud in the panel. The failure this exists for is
+    /// invisible otherwise: if the keychain can't be reached the key lands in a
+    /// file instead, and the app carries on working while quietly keeping a
+    /// secret somewhere it told the user it wouldn't.
+    pub in_file: bool,
 }
 
 /// Per-backend choices, plus the keys behind them.
@@ -138,9 +145,14 @@ impl Creds {
     }
 
     pub fn status(&self, backend: &str) -> Status {
+        let in_file = read_from_file(&self.fallback, backend).is_some();
         Status {
             auth: self.mode(backend),
-            has_key: self.key(backend).is_some(),
+            // `in_file` counts too: a key we can only find in the fallback is
+            // still a key, and reporting otherwise would have the panel offer
+            // to save one that is already there.
+            has_key: in_file || self.key(backend).is_some(),
+            in_file,
         }
     }
 
@@ -219,11 +231,43 @@ fn read_file(path: &Path) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Locks a file down to its owner on Windows.
+///
+/// The profile directory this sits in is already user-scoped by default, but
+/// "by default" is not the same as "checked": inherited ACLs are whatever the
+/// machine's policy left them, and this file holds a plaintext API key. So the
+/// inheritance is dropped and the owner re-granted explicitly.
+///
+/// Best-effort by design — on a machine where `icacls` won't run, a key in a
+/// profile-scoped file beats refusing to save one at all.
+#[cfg(windows)]
+fn lock_down(path: &Path) {
+    let Some(user) = std::env::var_os("USERNAME") else {
+        return;
+    };
+    let mut cmd = std::process::Command::new("icacls");
+    cmd.arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{}:(R,W)", user.to_string_lossy()))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    super::detect::hide_console(&mut cmd);
+    let _ = cmd.status();
+}
+
+#[cfg(not(windows))]
+fn lock_down(_path: &Path) {}
+
 /// Writes the fallback store with owner-only permissions.
 ///
-/// The mode is set as part of opening the file rather than afterwards: between
-/// a default-permission create and a chmod there is a window in which another
-/// local user can open the file, and it holds an API key.
+/// On unix the mode is set as part of opening the file rather than afterwards:
+/// between a default-permission create and a chmod there is a window in which
+/// another local user can open the file, and it holds an API key. Windows has
+/// no equivalent at open time, so [`lock_down`] follows the write — and it runs
+/// against the temporary, before the rename, so the file is never briefly
+/// readable at its final name.
 fn write_file(path: &Path, keys: &BTreeMap<String, String>) -> Result<(), String> {
     use std::io::Write;
 
@@ -241,6 +285,7 @@ fn write_file(path: &Path, keys: &BTreeMap<String, String>) -> Result<(), String
     let mut file = options.open(&tmp).map_err(|e| e.to_string())?;
     file.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
     drop(file);
+    lock_down(&tmp);
     fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
@@ -302,7 +347,10 @@ mod tests {
         let dir = tempdir("persist");
         Creds::load(&dir).use_subscription("codex").unwrap();
 
-        assert_eq!(Creds::load(&dir).plan("codex").unwrap().auth, Auth::Subscription);
+        assert_eq!(
+            Creds::load(&dir).plan("codex").unwrap().auth,
+            Auth::Subscription
+        );
         // The plaintext side of the store must be exactly the choice, so that
         // a user reading it finds no secret and no surprise.
         let raw = fs::read_to_string(dir.join("auth.json")).unwrap();
@@ -333,11 +381,17 @@ mod tests {
 
         write_to_file(&path, "claude", "sk-ant-test").unwrap();
         write_to_file(&path, "codex", "sk-oai-test").unwrap();
-        assert_eq!(read_from_file(&path, "claude").as_deref(), Some("sk-ant-test"));
+        assert_eq!(
+            read_from_file(&path, "claude").as_deref(),
+            Some("sk-ant-test")
+        );
 
         remove_from_file(&path, "claude").unwrap();
         assert!(read_from_file(&path, "claude").is_none());
-        assert_eq!(read_from_file(&path, "codex").as_deref(), Some("sk-oai-test"));
+        assert_eq!(
+            read_from_file(&path, "codex").as_deref(),
+            Some("sk-oai-test")
+        );
 
         // Emptying it takes the file with it rather than leaving `{}` behind.
         remove_from_file(&path, "codex").unwrap();
@@ -357,7 +411,9 @@ mod tests {
         let backend = "purrch-selftest";
         let entry = entry(backend).expect("no keychain entry could be built");
 
-        entry.set_password("sk-not-a-real-key").expect("keychain write failed");
+        entry
+            .set_password("sk-not-a-real-key")
+            .expect("keychain write failed");
         assert_eq!(
             entry.get_password().ok().as_deref(),
             Some("sk-not-a-real-key"),

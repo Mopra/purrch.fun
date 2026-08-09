@@ -27,6 +27,35 @@ export interface Backend {
   auth: Auth;
   /** A key is saved for it. Never the key itself — that stays in Rust. */
   hasKey: boolean;
+  /**
+   * That key is in a file rather than the OS credential store.
+   *
+   * Only true when the keychain couldn't be reached. Surfaced because the
+   * alternative is the app quietly keeping a secret somewhere it said it
+   * wouldn't, and the user having no way to find that out.
+   */
+  keyInFile: boolean;
+  /** This adapter has never been run against the real CLI. */
+  experimental: boolean;
+}
+
+/** A CLI that's installed but that Purrch can't drive yet. */
+export interface Other {
+  id: string;
+  label: string;
+}
+
+/**
+ * What detection found, split by whether a turn can actually run on it.
+ *
+ * The split comes from Rust rather than being a flag the picker has to
+ * remember to filter on: a backend with no adapter dies at spawn time, so the
+ * shape of the data is what keeps it off the menu. `others` exists so an
+ * installed CLI is explained rather than ignored.
+ */
+export interface Detected {
+  backends: Backend[];
+  others: Other[];
 }
 
 export type BridgeEvent =
@@ -56,7 +85,10 @@ async function tauri() {
   return await import("@tauri-apps/api/core");
 }
 
-/** Rust serializes `signed_in`; normalize to the camelCase the UI uses. */
+/**
+ * Rust sends camelCase now, but older builds sent snake_case for some of these
+ * and the cost of accepting both is one `??` per field.
+ */
 function normalize(raw: any): Backend {
   return {
     id: raw.id,
@@ -68,6 +100,8 @@ function normalize(raw: any): Backend {
     keyEnv: raw.key_env ?? raw.keyEnv ?? null,
     auth: raw.auth ?? "inherit",
     hasKey: raw.has_key ?? raw.hasKey ?? false,
+    keyInFile: raw.key_in_file ?? raw.keyInFile ?? false,
+    experimental: raw.experimental ?? false,
   };
 }
 
@@ -107,11 +141,14 @@ export async function clearAuth(backend: string): Promise<void> {
   await api?.invoke("creds_clear", { backend });
 }
 
-export async function detect(): Promise<Backend[]> {
+export async function detect(): Promise<Detected> {
   const api = await tauri();
-  if (!api) return [];
-  const raw = await api.invoke<any[]>("bridge_detect");
-  return raw.map(normalize);
+  if (!api) return { backends: [], others: [] };
+  const raw = await api.invoke<any>("bridge_detect");
+  return {
+    backends: (raw.backends ?? []).map(normalize),
+    others: raw.others ?? [],
+  };
 }
 
 export async function homeDir(): Promise<string | null> {

@@ -28,12 +28,31 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Mopra/purrch.fun/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVDODQxNkVCQjdGQTc1ODMKUldTRGRmcTM2eGFFWE5wbXNZZmc2SndicnpNTFhUbHNjQjB4aUNsRVM4ZS9rVUZ4ZHVqckxCN24K",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico", "icons/icon.png"]
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "publisher": "Purrch",
+    "shortDescription": "A pixel cat that runs your PC for you",
+    "longDescription": "Purrch puts a pixel cat on your taskbar and drives an agent CLI you already pay for. Ask it to do things on your machine, or hand it chores it works through on its own.",
+    "windows": {
+      "nsis": {
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
   }
 }
